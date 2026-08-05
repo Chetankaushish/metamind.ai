@@ -1,0 +1,20 @@
+groups:
+  - name: metamind_alerts
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MetaMind service {{ $labels.instance }} is down"
+          description: "Instance {{ $labels.instance }} of job {{ $labels.job }} has been unreachable for over 1 minute."
+
+      - alert: HighMemoryUsage
+        expr: (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hostinger VPS Memory usage above 85%"
+          description: "System memory consumption on VPS exceeds 85% for 5 minutes."

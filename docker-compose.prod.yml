@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  nginx:
+    ports:
+      - "80:80"
+      - "443:443"
+    restart: always
+
+  frontend:
+    restart: always
+
+  backend:
+    restart: always
+
+  celery_worker:
+    restart: always
+
+  celery_beat:
+    restart: always
+
+  postgres:
+    restart: always
+
+  redis:
+    restart: always

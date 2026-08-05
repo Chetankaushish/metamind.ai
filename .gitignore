@@ -1,0 +1,69 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.cache/
+.venv/
+venv/
+ENV/
+backups/
+*.tar.gz
+*.zip
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment
+.env
+.env.*
+
+# Node
+node_modules/
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+backend/venv/
+backend/__pycache__/
+**/__pycache__/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Database
+*.db
+*.sqlite3
+
+# Secrets
+.env.production
+.env.local
+.env.development
+
+# Logs
+logs/
+*.pid
+
+# SSL Certificates
+*.pem
+*.key
+*.crt
+nginx/ssl/
+certbot/

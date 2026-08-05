@@ -1,0 +1,23 @@
+version: 1
+disable_existing_loggers: false
+
+formatters:
+  json:
+    class: pythonjsonlogger.jsonlogger.JsonFormatter
+    format: '%(asctime)s %(levelname)s %(name)s %(message)s'
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    formatter: json
+    stream: ext://sys.stdout
+  file:
+    class: logging.handlers.RotatingFileHandler
+    formatter: json
+    filename: /var/log/metamind/app.log
+    maxBytes: 20971520 # 20MB
+    backupCount: 5
+
+root:
+  level: INFO
+  handlers: [console, file]
