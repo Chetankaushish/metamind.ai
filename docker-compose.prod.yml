@@ -15,17 +15,16 @@ services:
       - ./nginx/ssl:/etc/letsencrypt:ro
       - ./nginx/certbot/www:/var/www/certbot:ro
     depends_on:
-      frontend:
-        condition: service_healthy
-      backend:
-        condition: service_healthy
+      - frontend
+      - backend
     networks:
       - metamind_network
     healthcheck:
-      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
 
   # Frontend Application (Vite + React)
   frontend:
@@ -39,8 +38,8 @@ services:
       - VITE_API_URL=https://${DOMAIN_NAME:-localhost}/api
     networks:
       - metamind_network
-    ports:
-    - "3000:3000"
+    expose:
+     - "3000"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000 >/dev/null || exit 1"]
       interval: 30s
@@ -70,8 +69,8 @@ services:
         condition: service_healthy
     networks:
       - metamind_network
-    ports:
-    - "8000:8000"
+    expose:
+    - "8000"
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"]
       interval: 10s
@@ -108,7 +107,7 @@ services:
     restart: always
     command: celery -A app.celery_app beat --loglevel=info
     environment:
-      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-metamind}:${POSTGRES_PASSWORD:-ChangeMeInProduction123!}@postgres:5432/${POSTGRES_DB:-metamind_prod}
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-metamind}:${POSTGRES_PASSWORD:-Adsmind2026DB}@postgres:5432/${POSTGRES_DB:-metamind_prod}
       - REDIS_URL=redis://redis:6379/0
     depends_on:
       backend:
@@ -134,8 +133,8 @@ services:
       - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     networks:
       - metamind_network
-    ports:
-    - "5432:5432"
+    expose:
+    - "5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-metamind} -d ${POSTGRES_DB:-metamind_prod}"]
       interval: 5s
@@ -152,8 +151,8 @@ services:
       - redis_data:/data
     networks:
       - metamind_network
-    ports:
-      - "6379:6379"
+    expose:
+    - "6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -170,8 +169,8 @@ services:
       - prometheus_data:/prometheus
     networks:
       - metamind_network
-    ports:
-    - "9090:9090"
+    expose:
+    - "9090"
 
 networks:
   metamind_network:

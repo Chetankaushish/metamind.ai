@@ -1,15 +1,28 @@
-FROM node:22-alpine
+# ==========================
+# AdsPilot Frontend Builder
+# ==========================
+
+FROM node:22-alpine AS builder
 
 WORKDIR /app
 
 COPY package*.json ./
 
-RUN npm install
+RUN npm ci
 
 COPY . .
 
 RUN npm run build
 
-EXPOSE 3000
+# --------------------------------------------------
+# Build artifact only
+# Nginx production container will serve /dist
+# --------------------------------------------------
 
-CMD ["npm","run","preview","--","--host","0.0.0.0","--port","3000"]
+FROM alpine:3.21
+
+WORKDIR /dist
+
+COPY --from=builder /app/dist .
+
+CMD ["sh", "-c", "echo 'AdsPilot frontend build is ready in /dist' && sleep infinity"]
