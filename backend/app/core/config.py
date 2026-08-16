@@ -61,10 +61,26 @@ class Settings(BaseSettings):
         return ["http://localhost:3000", "http://localhost:8000"]
 
     # Meta API
+        # Meta API
     META_APP_ID: str = os.getenv("META_APP_ID", "")
     META_APP_SECRET: str = os.getenv("META_APP_SECRET", "")
-    META_WEBHOOK_VERIFY_TOKEN: str = os.getenv("META_WEBHOOK_VERIFY_TOKEN", "")
-    META_GRAPH_API_VERSION: str = "v19.0"
+
+    META_REDIRECT_URI: str = os.getenv(
+        "META_REDIRECT_URI",
+        "https://adsmind.online/api/v1/auth/meta/callback"
+    )
+
+    META_ACCESS_TOKEN: str = os.getenv("META_ACCESS_TOKEN", "")
+
+    META_WEBHOOK_VERIFY_TOKEN: str = os.getenv(
+        "META_WEBHOOK_VERIFY_TOKEN",
+        os.getenv("META_VERIFY_TOKEN", "")
+    )
+
+    META_GRAPH_API_VERSION: str = os.getenv(
+        "META_API_VERSION",
+        "v23.0"
+    )
 
     @model_validator(mode="after")
     def validate_production_environment(self) -> "Settings":

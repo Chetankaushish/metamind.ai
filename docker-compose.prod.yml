@@ -55,13 +55,13 @@ services:
     container_name: metamind_backend
     restart: always
     environment:
-      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-metamind}:${POSTGRES_PASSWORD:-ChangeMeInProduction123!}@postgres:5432/${POSTGRES_DB:-metamind_prod}
+      - DATABASE_URL={DATABASE_URL}
       - REDIS_URL=redis://redis:6379/0
-      - JWT_SECRET=${JWT_SECRET:-super_secret_jwt_key_32_bytes_long_1234}
-      - META_APP_ID=${META_APP_ID:-1092840192840}
-      - META_APP_SECRET=${META_APP_SECRET:-dummy_app_secret}
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - DOMAIN_NAME=${DOMAIN_NAME:-localhost}
+      - JWT_SECRET=${JWT_SECRET}
+      - META_APP_ID=${META_APP_ID}
+      - META_APP_SECRET=${META_APP_SECRET}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - DOMAIN_NAME=${DOMAIN_NAME}
     depends_on:
       postgres:
         condition: service_healthy

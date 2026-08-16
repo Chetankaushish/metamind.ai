@@ -67,3 +67,4 @@ logs/
 *.crt
 nginx/ssl/
 certbot/
+*_backup.py

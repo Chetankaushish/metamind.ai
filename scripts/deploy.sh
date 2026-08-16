@@ -16,7 +16,7 @@ git pull origin main
 
 echo ""
 echo "🛑 Stopping old containers..."
-docker compose -f docker-compose.prod.yml down
+docker compose --env-file .env.production -f docker-compose.prod.yml down
 
 echo ""
 echo "🧹 Removing unused images..."
@@ -24,11 +24,11 @@ docker image prune -f
 
 echo ""
 echo "🏗️ Building containers..."
-docker compose -f docker-compose.prod.yml build --no-cache
+docker compose --env-file .env.production -f docker-compose.prod.yml build --no-cache
 
 echo ""
 echo "🚀 Starting services..."
-docker compose -f docker-compose.prod.yml up -d
+docker compose --env-file .env.production -f docker-compose.prod.yml up -d
 
 echo ""
 echo "⏳ Waiting for services..."

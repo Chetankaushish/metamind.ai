@@ -1,6 +1,7 @@
 import datetime
 import json
 from typing import List, Dict, Any, Optional
+
 import redis.asyncio as redis
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -8,115 +9,170 @@ from sqlalchemy import func, and_
 
 from app.core.config import settings
 from app.models.models import (
-    Campaign as CampaignModel, MetaAdSet as AdSetModel, MetaAd as AdModel,
-    Insight as InsightModel, SyncJob as SyncJobModel, MetaAccount as MetaAccountModel
-)
-from app.schemas.schemas import (
-    DashboardOverviewResponse, DashboardKPIsResponse, DashboardChartsResponse,
-    ChartDataPoint, TopCampaignItem, TopAdItem, TrendItem, BreakdownItem,
-    CampaignComparisonItem, TimePerformanceItem, ComparisonSummaryResponse
+    Campaign as CampaignModel,
+    MetaAdSet as AdSetModel,
+    MetaAd as AdModel,
+    Insight as InsightModel,
+    SyncJob as SyncJobModel,
+    MetaAccount as MetaAccountModel,
 )
 
+from app.schemas.schemas import (
+    DashboardOverviewResponse,
+    DashboardKPIsResponse,
+    DashboardChartsResponse,
+    ChartDataPoint,
+    TopCampaignItem,
+    TopAdItem,
+    TrendItem,
+    BreakdownItem,
+    CampaignComparisonItem,
+    TimePerformanceItem,
+    ComparisonSummaryResponse,
+)
+
+
 CACHE_STORE: Dict[str, Any] = {}
-CACHE_TIMESTAMP: Optional[datetime.datetime] = None
+
 
 class DashboardService:
     @staticmethod
     async def get_cache(key: str) -> Optional[Any]:
         global CACHE_STORE
+
         try:
             r = redis.from_url(settings.REDIS_URL, decode_responses=True)
             val = await r.get(f"dashboard:{key}")
             await r.aclose()
+
             if val:
                 return json.loads(val)
-        except (redis.RedisError, ConnectionError, json.JSONDecodeError, KeyError, TypeError, ValueError, OSError):
+
+        except (
+            redis.RedisError,
+            ConnectionError,
+            json.JSONDecodeError,
+            OSError,
+        ):
             pass
+
         return CACHE_STORE.get(key)
 
     @staticmethod
-    async def set_cache(key: str, data: Any, ttl_seconds: int = 300):
+    async def set_cache(
+        key: str,
+        data: Any,
+        ttl_seconds: int = 300,
+    ):
         global CACHE_STORE
+
         CACHE_STORE[key] = data
+
         try:
             r = redis.from_url(settings.REDIS_URL, decode_responses=True)
-            await r.setex(f"dashboard:{key}", ttl_seconds, json.dumps(data, default=str))
+            await r.setex(
+                f"dashboard:{key}",
+                ttl_seconds,
+                json.dumps(data, default=str),
+            )
             await r.aclose()
-        except (redis.RedisError, ConnectionError, json.JSONDecodeError, KeyError, TypeError, ValueError, OSError):
+
+        except (
+            redis.RedisError,
+            ConnectionError,
+            json.JSONDecodeError,
+            OSError,
+        ):
             pass
 
     @staticmethod
     def invalidate_cache():
-        global CACHE_STORE, CACHE_TIMESTAMP
+        global CACHE_STORE
+
         CACHE_STORE.clear()
-        CACHE_TIMESTAMP = None
+
         try:
             import redis as sync_redis
+
             r = sync_redis.from_url(settings.REDIS_URL)
             keys = r.keys("dashboard:*")
+
             if keys:
                 r.delete(*keys)
+
             r.close()
-        except (sync_redis.RedisError, ConnectionError, KeyError, TypeError, ValueError, OSError):
+
+        except (
+            sync_redis.RedisError,
+            ConnectionError,
+            KeyError,
+            TypeError,
+            ValueError,
+            OSError,
+        ):
             pass
 
-    @classmethod
-    async def get_kpis(
-        cls,
-        db: AsyncSession,
-        status: Optional[str] = None,
-        objective: Optional[str] = None
-    ) -> DashboardKPIsResponse:
-        cache_key = f"kpis:{status}:{objective}"
-        cached = await cls.get_cache(cache_key)
-        if cached:
-            return DashboardKPIsResponse(**cached)
-
-        conditions = []
-        if status:
-            conditions.append(CampaignModel.status == status.upper())
-        if objective:
-            conditions.append(CampaignModel.objective == objective.upper())
-
-        stmt = select(
-            func.count(CampaignModel.id).label("camp_count"),
-            func.coalesce(func.sum(CampaignModel.spend), 0.0).label("spend"),
-            func.coalesce(func.sum(CampaignModel.revenue), 0.0).label("revenue"),
-            func.coalesce(func.sum(CampaignModel.purchases), 0).label("purchases"),
-            func.coalesce(func.sum(CampaignModel.clicks), 0).label("clicks"),
-            func.coalesce(func.sum(CampaignModel.impressions), 0).label("impressions"),
-            func.coalesce(func.sum(CampaignModel.reach), 0).label("reach"),
-            func.coalesce(func.sum(CampaignModel.daily_budget), 0.0).label("budget"),
-            select(func.count(AdSetModel.id)).scalar_subquery().label("adset_count"),
-            select(func.count(AdModel.id)).scalar_subquery().label("ads_count")
+    @staticmethod
+    def _campaign_level_filter():
+        """
+        Insight rows written by the Meta sync are hierarchical:
+        campaign-level rows have campaign_id populated and ad_set_id/ad_id null.
+        This prevents campaign + ad set + ad rows from being double-counted.
+        """
+        return and_(
+            InsightModel.ad_set_id.is_(None),
+            InsightModel.ad_id.is_(None),
         )
-        if conditions:
-            stmt = stmt.where(and_(*conditions))
 
-        result = await db.execute(stmt)
-        agg = result.fetchone()
+    @staticmethod
+    def _metric_values(row) -> Dict[str, float]:
+        spend = float(row.spend or 0)
+        revenue = float(row.revenue or 0)
+        purchases = int(row.purchases or 0)
+        clicks = int(row.clicks or 0)
+        impressions = int(row.impressions or 0)
+        reach = int(row.reach or 0)
 
-        camp_count = int(agg.camp_count) if agg and agg.camp_count else 0
-        adset_count = int(agg.adset_count) if agg and agg.adset_count else 0
-        ads_count = int(agg.ads_count) if agg and agg.ads_count else 0
-        spend = float(agg.spend) if agg and agg.spend else 0.0
-        revenue = float(agg.revenue) if agg and agg.revenue else 0.0
-        purchases = int(agg.purchases) if agg and agg.purchases else 0
-        clicks = int(agg.clicks) if agg and agg.clicks else 0
-        impressions = int(agg.impressions) if agg and agg.impressions else 0
-        reach = int(agg.reach) if agg and agg.reach else 0
-        budget = float(agg.budget) if agg and agg.budget else 0.0
+        return {
+            "spend": spend,
+            "revenue": revenue,
+            "purchases": purchases,
+            "clicks": clicks,
+            "impressions": impressions,
+            "reach": reach,
+        }
 
-        has_data = camp_count > 0 or spend > 0.0
-
+    @classmethod
+    def _build_kpis(
+        cls,
+        *,
+        spend: float,
+        revenue: float,
+        purchases: int,
+        clicks: int,
+        impressions: int,
+        reach: int,
+        budget: float,
+        campaign_count: int,
+        adset_count: int,
+        ads_count: int,
+    ) -> DashboardKPIsResponse:
         roas = round(revenue / spend, 2) if spend > 0 else 0.0
         cpa = round(spend / purchases, 2) if purchases > 0 else 0.0
         cpc = round(spend / clicks, 2) if clicks > 0 else 0.0
         cpm = round((spend / impressions) * 1000, 2) if impressions > 0 else 0.0
         ctr = round((clicks / impressions) * 100, 2) if impressions > 0 else 0.0
-        frequency = round(impressions / reach, 2) if reach > 0 else 1.0
+        frequency = round(impressions / reach, 2) if reach > 0 else 0.0
 
-        res = DashboardKPIsResponse(
+        has_data = (
+            spend > 0
+            or revenue > 0
+            or purchases > 0
+            or clicks > 0
+            or impressions > 0
+        )
+
+        return DashboardKPIsResponse(
             spend=spend,
             revenue=revenue,
             roas=roas,
@@ -130,76 +186,269 @@ class DashboardService:
             purchases=purchases,
             conversions=purchases,
             budget=budget,
-            campaign_count=camp_count,
+            campaign_count=campaign_count,
             ad_set_count=adset_count,
             ads_count=ads_count,
-            has_data=has_data
+            has_data=has_data,
         )
+
+    @classmethod
+    async def _aggregate_insights(
+        cls,
+        db: AsyncSession,
+        start_date: Optional[datetime.date] = None,
+        end_date: Optional[datetime.date] = None,
+        status: Optional[str] = None,
+        objective: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        conditions = [cls._campaign_level_filter()]
+
+        if start_date:
+            conditions.append(InsightModel.date_start >= start_date.isoformat())
+
+        if end_date:
+            conditions.append(InsightModel.date_start <= end_date.isoformat())
+
+        stmt = select(
+            func.coalesce(func.sum(InsightModel.spend), 0.0).label("spend"),
+            func.coalesce(func.sum(InsightModel.revenue), 0.0).label("revenue"),
+            func.coalesce(func.sum(InsightModel.purchases), 0).label("purchases"),
+            func.coalesce(func.sum(InsightModel.clicks), 0).label("clicks"),
+            func.coalesce(func.sum(InsightModel.impressions), 0).label("impressions"),
+            func.coalesce(func.sum(InsightModel.reach), 0).label("reach"),
+            func.count(func.distinct(InsightModel.campaign_id)).label("campaign_count"),
+        ).select_from(InsightModel)
+
+        if status or objective:
+            stmt = stmt.join(
+                CampaignModel,
+                CampaignModel.campaign_id == InsightModel.campaign_id,
+            )
+
+            if status:
+                conditions.append(CampaignModel.status == status.upper())
+
+            if objective:
+                conditions.append(CampaignModel.objective == objective.upper())
+
+        stmt = stmt.where(and_(*conditions))
+
+        result = await db.execute(stmt)
+        row = result.one()
+
+        campaign_count = int(row.campaign_count or 0)
+
+        # Budget is configuration, not a historical Insight metric.
+        budget_stmt = select(
+            func.coalesce(func.sum(CampaignModel.daily_budget), 0.0)
+        )
+
+        if status:
+            budget_stmt = budget_stmt.where(
+                CampaignModel.status == status.upper()
+            )
+
+        if objective:
+            budget_stmt = budget_stmt.where(
+                CampaignModel.objective == objective.upper()
+            )
+
+        budget_result = await db.execute(budget_stmt)
+        budget = float(budget_result.scalar() or 0.0)
+
+        # Counts are metadata counts, not performance totals.
+        count_stmt = select(
+            func.count(AdSetModel.id),
+        )
+
+        adset_result = await db.execute(count_stmt)
+        adset_count = int(adset_result.scalar() or 0)
+
+        ads_result = await db.execute(select(func.count(AdModel.id)))
+        ads_count = int(ads_result.scalar() or 0)
+
+        return {
+            "spend": float(row.spend or 0),
+            "revenue": float(row.revenue or 0),
+            "purchases": int(row.purchases or 0),
+            "clicks": int(row.clicks or 0),
+            "impressions": int(row.impressions or 0),
+            "reach": int(row.reach or 0),
+            "campaign_count": campaign_count,
+            "adset_count": adset_count,
+            "ads_count": ads_count,
+            "budget": budget,
+        }
+
+    @classmethod
+    async def get_kpis(
+        cls,
+        db: AsyncSession,
+        status: Optional[str] = None,
+        objective: Optional[str] = None,
+    ) -> DashboardKPIsResponse:
+        cache_key = f"kpis:{status}:{objective}"
+        cached = await cls.get_cache(cache_key)
+
+        if cached:
+            return DashboardKPIsResponse(**cached)
+
+        agg = await cls._aggregate_insights(
+            db=db,
+            status=status,
+            objective=objective,
+        )
+
+        res = cls._build_kpis(
+            spend=agg["spend"],
+            revenue=agg["revenue"],
+            purchases=agg["purchases"],
+            clicks=agg["clicks"],
+            impressions=agg["impressions"],
+            reach=agg["reach"],
+            budget=agg["budget"],
+            campaign_count=agg["campaign_count"],
+            adset_count=agg["adset_count"],
+            ads_count=agg["ads_count"],
+        )
+
         await cls.set_cache(cache_key, res.model_dump())
         return res
 
     @classmethod
-    async def get_overview(cls, db: AsyncSession) -> DashboardOverviewResponse:
+    async def get_overview(
+        cls,
+        db: AsyncSession,
+    ) -> DashboardOverviewResponse:
         kpis = await cls.get_kpis(db=db)
 
-        sync_stmt = select(SyncJobModel).where(SyncJobModel.status == "completed").order_by(SyncJobModel.completed_at.desc()).limit(1)
+        sync_stmt = (
+            select(SyncJobModel)
+            .where(SyncJobModel.status == "completed")
+            .order_by(SyncJobModel.completed_at.desc())
+            .limit(1)
+        )
         sync_res = await db.execute(sync_stmt)
         last_job = sync_res.scalar_one_or_none()
-        last_sync_str = last_job.completed_at.isoformat() if last_job and last_job.completed_at else None
+
+        last_sync_str = (
+            last_job.completed_at.isoformat()
+            if last_job and last_job.completed_at
+            else None
+        )
 
         acc_stmt = select(MetaAccountModel).limit(1)
         acc_res = await db.execute(acc_stmt)
         meta_acc = acc_res.scalar_one_or_none()
-        connection_status = meta_acc.connection_status if meta_acc else "connected"
+
+        connection_status = (
+            meta_acc.connection_status
+            if meta_acc
+            else "not_connected"
+        )
 
         return DashboardOverviewResponse(
             kpis=kpis,
             last_sync_time=last_sync_str,
             connection_status=connection_status,
-            is_synced=kpis.has_data
+            is_synced=kpis.has_data,
         )
 
     @classmethod
-    async def get_charts(cls, db: AsyncSession) -> DashboardChartsResponse:
-        today = datetime.date.today()
+    async def get_charts(
+        cls,
+        db: AsyncSession,
+    ) -> DashboardChartsResponse:
+        end_date = datetime.date.today()
+        start_date = end_date - datetime.timedelta(days=6)
+
+        stmt = (
+            select(
+                InsightModel.date_start,
+                func.coalesce(func.sum(InsightModel.spend), 0.0).label("spend"),
+                func.coalesce(func.sum(InsightModel.revenue), 0.0).label("revenue"),
+                func.coalesce(func.sum(InsightModel.purchases), 0).label("purchases"),
+                func.coalesce(func.sum(InsightModel.clicks), 0).label("clicks"),
+                func.coalesce(func.sum(InsightModel.impressions), 0).label("impressions"),
+            )
+            .where(
+                cls._campaign_level_filter(),
+                InsightModel.date_start >= start_date.isoformat(),
+                InsightModel.date_start <= end_date.isoformat(),
+            )
+            .group_by(InsightModel.date_start)
+            .order_by(InsightModel.date_start)
+        )
+
+        result = await db.execute(stmt)
+        rows = result.all()
+
+        if not rows:
+            return DashboardChartsResponse(
+                spend_trend=[],
+                revenue_trend=[],
+                roas_trend=[],
+                conversion_trend=[],
+            )
+
         points = []
-        
-        kpis = await cls.get_kpis(db=db)
-        if not kpis.has_data:
-            return DashboardChartsResponse(spend_trend=[], revenue_trend=[], roas_trend=[], conversion_trend=[])
 
-        base_spend = kpis.spend / 7.0 if kpis.spend > 0 else 3200.0
-        base_rev = kpis.revenue / 7.0 if kpis.revenue > 0 else 13000.0
-        multipliers = [0.85, 0.92, 1.05, 0.98, 1.12, 1.08, 1.0]
+        for row in rows:
+            spend = float(row.spend or 0)
+            revenue = float(row.revenue or 0)
+            purchases = int(row.purchases or 0)
+            clicks = int(row.clicks or 0)
+            impressions = int(row.impressions or 0)
 
-        for i in range(6, -1, -1):
-            day_date = (today - datetime.timedelta(days=i)).strftime("%b %d")
-            mult = multipliers[6 - i]
-            d_spend = round(base_spend * mult, 2)
-            d_rev = round(base_rev * mult, 2)
-            d_roas = round(d_rev / d_spend, 2) if d_spend > 0 else 0.0
-            d_conv = int((kpis.purchases / 7.0) * mult)
+            roas = round(revenue / spend, 2) if spend > 0 else 0.0
+            ctr = (
+                round((clicks / impressions) * 100, 2)
+                if impressions > 0
+                else 0.0
+            )
+            cpa = (
+                round(spend / purchases, 2)
+                if purchases > 0
+                else 0.0
+            )
 
-            points.append(ChartDataPoint(
-                date=day_date,
-                spend=d_spend,
-                revenue=d_rev,
-                roas=d_roas,
-                ctr=kpis.ctr,
-                cpa=kpis.cpa,
-                conversions=d_conv
-            ))
+            try:
+                display_date = datetime.date.fromisoformat(
+                    str(row.date_start)[:10]
+                ).strftime("%b %d")
+            except ValueError:
+                display_date = str(row.date_start)
+
+            points.append(
+                ChartDataPoint(
+                    date=display_date,
+                    spend=spend,
+                    revenue=revenue,
+                    roas=roas,
+                    ctr=ctr,
+                    cpa=cpa,
+                    conversions=purchases,
+                )
+            )
 
         return DashboardChartsResponse(
             spend_trend=points,
             revenue_trend=points,
             roas_trend=points,
-            conversion_trend=points
+            conversion_trend=points,
         )
 
     @classmethod
-    async def get_top_campaigns(cls, db: AsyncSession) -> List[TopCampaignItem]:
-        stmt = select(CampaignModel).order_by(CampaignModel.spend.desc()).limit(5)
+    async def get_top_campaigns(
+        cls,
+        db: AsyncSession,
+    ) -> List[TopCampaignItem]:
+        stmt = (
+            select(CampaignModel)
+            .order_by(CampaignModel.spend.desc())
+            .limit(5)
+        )
+
         result = await db.execute(stmt)
         campaigns = result.scalars().all()
 
@@ -208,18 +457,28 @@ class DashboardService:
                 id=c.campaign_id,
                 name=c.name,
                 status=c.status,
-                spend=c.spend,
-                revenue=c.revenue,
-                roas=c.roas,
-                ctr=c.ctr,
-                cpa=c.cpa,
-                purchases=c.purchases
-            ) for c in campaigns
+                spend=float(c.spend or 0),
+                revenue=float(c.revenue or 0),
+                roas=float(c.roas or 0),
+                ctr=float(c.ctr or 0),
+                cpa=float(c.cpa or 0),
+                purchases=int(c.purchases or 0),
+            )
+            for c in campaigns
         ]
 
     @classmethod
-    async def get_worst_campaigns(cls, db: AsyncSession) -> List[TopCampaignItem]:
-        stmt = select(CampaignModel).where(CampaignModel.spend > 0).order_by(CampaignModel.cpa.desc()).limit(5)
+    async def get_worst_campaigns(
+        cls,
+        db: AsyncSession,
+    ) -> List[TopCampaignItem]:
+        stmt = (
+            select(CampaignModel)
+            .where(CampaignModel.spend > 0)
+            .order_by(CampaignModel.cpa.desc())
+            .limit(5)
+        )
+
         result = await db.execute(stmt)
         campaigns = result.scalars().all()
 
@@ -228,51 +487,91 @@ class DashboardService:
                 id=c.campaign_id,
                 name=c.name,
                 status=c.status,
-                spend=c.spend,
-                revenue=c.revenue,
-                roas=c.roas,
-                ctr=c.ctr,
-                cpa=c.cpa,
-                purchases=c.purchases
-            ) for c in campaigns
+                spend=float(c.spend or 0),
+                revenue=float(c.revenue or 0),
+                roas=float(c.roas or 0),
+                ctr=float(c.ctr or 0),
+                cpa=float(c.cpa or 0),
+                purchases=int(c.purchases or 0),
+            )
+            for c in campaigns
         ]
 
     @classmethod
-    async def get_campaign_comparison(cls, db: AsyncSession) -> List[CampaignComparisonItem]:
-        stmt = select(CampaignModel).order_by(CampaignModel.spend.desc()).limit(10)
+    async def get_campaign_comparison(
+        cls,
+        db: AsyncSession,
+    ) -> List[CampaignComparisonItem]:
+        stmt = (
+            select(CampaignModel)
+            .order_by(CampaignModel.spend.desc())
+            .limit(10)
+        )
+
         result = await db.execute(stmt)
         campaigns = result.scalars().all()
 
-        avg_roas = sum(c.roas for c in campaigns) / max(len(campaigns), 1)
-        avg_cpa = sum(c.cpa for c in campaigns) / max(len(campaigns), 1)
+        if not campaigns:
+            return []
+
+        avg_roas = (
+            sum(float(c.roas or 0) for c in campaigns) / len(campaigns)
+        )
+        avg_cpa = (
+            sum(float(c.cpa or 0) for c in campaigns) / len(campaigns)
+        )
 
         items = []
+
         for c in campaigns:
-            roas_delta = round(((c.roas - avg_roas) / avg_roas) * 100, 1) if avg_roas > 0 else 0.0
-            cpa_delta = round(((c.cpa - avg_cpa) / avg_cpa) * 100, 1) if avg_cpa > 0 else 0.0
-            items.append(CampaignComparisonItem(
-                id=c.campaign_id,
-                name=c.name,
-                status=c.status,
-                objective=c.objective,
-                spend=c.spend,
-                revenue=c.revenue,
-                roas=c.roas,
-                cpa=c.cpa,
-                ctr=c.ctr,
-                cpm=c.cpm,
-                cpc=c.cpc,
-                purchases=c.purchases,
-                impressions=c.impressions,
-                clicks=c.clicks,
-                roas_delta_pct=roas_delta,
-                cpa_delta_pct=cpa_delta
-            ))
+            roas = float(c.roas or 0)
+            cpa = float(c.cpa or 0)
+
+            roas_delta = (
+                round(((roas - avg_roas) / avg_roas) * 100, 1)
+                if avg_roas > 0
+                else 0.0
+            )
+            cpa_delta = (
+                round(((cpa - avg_cpa) / avg_cpa) * 100, 1)
+                if avg_cpa > 0
+                else 0.0
+            )
+
+            items.append(
+                CampaignComparisonItem(
+                    id=c.campaign_id,
+                    name=c.name,
+                    status=c.status,
+                    objective=c.objective,
+                    spend=float(c.spend or 0),
+                    revenue=float(c.revenue or 0),
+                    roas=roas,
+                    cpa=cpa,
+                    ctr=float(c.ctr or 0),
+                    cpm=float(c.cpm or 0),
+                    cpc=float(c.cpc or 0),
+                    purchases=int(c.purchases or 0),
+                    impressions=int(c.impressions or 0),
+                    clicks=int(c.clicks or 0),
+                    roas_delta_pct=roas_delta,
+                    cpa_delta_pct=cpa_delta,
+                )
+            )
+
         return items
 
     @classmethod
-    async def get_top_ads(cls, db: AsyncSession) -> List[TopAdItem]:
-        stmt = select(AdModel).order_by(AdModel.spend.desc()).limit(5)
+    async def get_top_ads(
+        cls,
+        db: AsyncSession,
+    ) -> List[TopAdItem]:
+        stmt = (
+            select(AdModel)
+            .order_by(AdModel.spend.desc())
+            .limit(5)
+        )
+
         result = await db.execute(stmt)
         ads = result.scalars().all()
 
@@ -282,255 +581,240 @@ class DashboardService:
                 name=a.name,
                 format=a.format,
                 status=a.status,
-                spend=a.spend,
-                ctr=a.ctr,
-                cpc=a.cpc,
-                fatigue_level=a.fatigue_level
-            ) for a in ads
+                spend=float(a.spend or 0),
+                ctr=float(a.ctr or 0),
+                cpc=float(a.cpc or 0),
+                fatigue_level=a.fatigue_level,
+            )
+            for a in ads
         ]
 
     @classmethod
-    async def get_trends(cls, db: AsyncSession) -> List[TrendItem]:
-        kpis = await cls.get_kpis(db=db)
+    async def _period_kpis(
+        cls,
+        db: AsyncSession,
+        start_date: datetime.date,
+        end_date: datetime.date,
+    ) -> DashboardKPIsResponse:
+        agg = await cls._aggregate_insights(
+            db=db,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        return cls._build_kpis(
+            spend=agg["spend"],
+            revenue=agg["revenue"],
+            purchases=agg["purchases"],
+            clicks=agg["clicks"],
+            impressions=agg["impressions"],
+            reach=agg["reach"],
+            budget=agg["budget"],
+            campaign_count=agg["campaign_count"],
+            adset_count=agg["adset_count"],
+            ads_count=agg["ads_count"],
+        )
+
+    @staticmethod
+    def _trend(
+        metric: str,
+        current: float,
+        previous: float,
+    ) -> TrendItem:
+        if previous == 0:
+            percent_change = 0.0 if current == 0 else None
+        else:
+            percent_change = round(
+                ((current - previous) / abs(previous)) * 100,
+                1,
+            )
+
+        if current > previous:
+            direction = "up"
+        elif current < previous:
+            direction = "down"
+        else:
+            direction = "flat"
+
+        return TrendItem(
+            metric=metric,
+            current_value=current,
+            previous_value=previous,
+            percent_change=percent_change,
+            direction=direction,
+        )
+
+    @classmethod
+    async def get_trends(
+        cls,
+        db: AsyncSession,
+    ) -> List[TrendItem]:
+        end_date = datetime.date.today()
+        current_start = end_date - datetime.timedelta(days=6)
+        previous_end = current_start - datetime.timedelta(days=1)
+        previous_start = previous_end - datetime.timedelta(days=6)
+
+        current = await cls._period_kpis(
+            db,
+            current_start,
+            end_date,
+        )
+        previous = await cls._period_kpis(
+            db,
+            previous_start,
+            previous_end,
+        )
 
         return [
-            TrendItem(
-                metric="ROAS",
-                current_value=kpis.roas,
-                previous_value=round(kpis.roas * 0.88, 2),
-                percent_change=13.6,
-                direction="up"
-            ),
-            TrendItem(
-                metric="Revenue",
-                current_value=kpis.revenue,
-                previous_value=round(kpis.revenue * 0.91, 2),
-                percent_change=9.8,
-                direction="up"
-            ),
-            TrendItem(
-                metric="CPA",
-                current_value=kpis.cpa,
-                previous_value=round(kpis.cpa * 1.12, 2),
-                percent_change=-10.7,
-                direction="down"
-            ),
-            TrendItem(
-                metric="CTR",
-                current_value=kpis.ctr,
-                previous_value=round(kpis.ctr * 0.94, 2),
-                percent_change=6.4,
-                direction="up"
-            )
+            cls._trend("ROAS", current.roas, previous.roas),
+            cls._trend("Revenue", current.revenue, previous.revenue),
+            cls._trend("CPA", current.cpa, previous.cpa),
+            cls._trend("CTR", current.ctr, previous.ctr),
         ]
 
     @classmethod
-    async def get_period_comparison(cls, db: AsyncSession) -> ComparisonSummaryResponse:
-        kpis = await cls.get_kpis(db=db)
+    async def get_period_comparison(
+        cls,
+        db: AsyncSession,
+    ) -> ComparisonSummaryResponse:
+        end_date = datetime.date.today()
+        current_start = end_date - datetime.timedelta(days=6)
+        previous_end = current_start - datetime.timedelta(days=1)
+        previous_start = previous_end - datetime.timedelta(days=6)
 
-        prev_spend = round(kpis.spend * 0.88, 2)
-        prev_rev = round(kpis.revenue * 0.85, 2)
-        prev_roas = round(prev_rev / prev_spend, 2) if prev_spend > 0 else 0.0
-        prev_purchases = max(1, int(kpis.purchases * 0.82))
-
-        prev_kpis = DashboardKPIsResponse(
-            spend=prev_spend,
-            revenue=prev_rev,
-            roas=prev_roas,
-            ctr=round(kpis.ctr * 0.92, 2),
-            cpm=round(kpis.cpm * 1.05, 2),
-            cpc=round(kpis.cpc * 1.08, 2),
-            cpa=round(kpis.cpa * 1.12, 2),
-            reach=int(kpis.reach * 0.85),
-            impressions=int(kpis.impressions * 0.87),
-            purchases=prev_purchases,
-            conversions=prev_purchases,
-            campaign_count=kpis.campaign_count,
-            ad_set_count=kpis.ad_set_count,
-            ads_count=kpis.ads_count,
-            has_data=kpis.has_data
+        current = await cls._period_kpis(
+            db,
+            current_start,
+            end_date,
         )
+        previous = await cls._period_kpis(
+            db,
+            previous_start,
+            previous_end,
+        )
+
+        def pct(current_value: float, previous_value: float) -> float:
+            if previous_value == 0:
+                return 0.0
+            return round(
+                ((current_value - previous_value) / abs(previous_value)) * 100,
+                1,
+            )
 
         top_camps = await cls.get_top_campaigns(db=db)
         worst_camps = await cls.get_worst_campaigns(db=db)
 
         return ComparisonSummaryResponse(
-            current_period=kpis,
-            previous_period=prev_kpis,
-            spend_growth_pct=13.6,
-            revenue_growth_pct=17.6,
-            roas_growth_pct=3.5,
-            cpa_growth_pct=-10.7,
-            purchases_growth_pct=21.9,
+            current_period=current,
+            previous_period=previous,
+            spend_growth_pct=pct(current.spend, previous.spend),
+            revenue_growth_pct=pct(current.revenue, previous.revenue),
+            roas_growth_pct=pct(current.roas, previous.roas),
+            cpa_growth_pct=pct(current.cpa, previous.cpa),
+            purchases_growth_pct=pct(
+                current.purchases,
+                previous.purchases,
+            ),
             best_performer=top_camps[0] if top_camps else None,
-            worst_performer=worst_camps[0] if worst_camps else None
+            worst_performer=worst_camps[0] if worst_camps else None,
         )
 
     @classmethod
-    async def get_breakdown(cls, db: AsyncSession, dimension: str) -> List[BreakdownItem]:
-        kpis = await cls.get_kpis(db=db)
-        total_spend = max(kpis.spend, 100.0)
+    async def get_breakdown(
+        cls,
+        db: AsyncSession,
+        dimension: str,
+    ) -> List[BreakdownItem]:
+        """
+        Only return breakdowns that are actually represented in the database.
 
-        configs = {
-            "platform": [
-                ("Instagram Reels & Stories", 0.45, 4.8),
-                ("Facebook News Feed", 0.32, 4.2),
-                ("Advantage+ Shopping Network", 0.15, 5.1),
-                ("Audience Network & Messenger", 0.08, 3.4)
-            ],
-            "device": [
-                ("Mobile App (iOS & Android)", 0.78, 4.6),
-                ("Desktop Web Browser", 0.18, 4.1),
-                ("Tablet Devices", 0.04, 3.2)
-            ],
-            "age": [
-                ("18 - 24", 0.12, 3.2),
-                ("25 - 34", 0.42, 4.9),
-                ("35 - 44", 0.28, 4.5),
-                ("45 - 54", 0.12, 3.8),
-                ("55+", 0.06, 2.9)
-            ],
-            "gender": [
-                ("Female", 0.58, 4.7),
-                ("Male", 0.38, 4.2),
-                ("Unspecified / Other", 0.04, 3.5)
-            ],
-            "geographic": [
-                ("United States (US)", 0.62, 4.8),
-                ("United Kingdom (UK)", 0.16, 4.1),
-                ("Canada (CA)", 0.12, 4.3),
-                ("Australia (AU)", 0.10, 3.9)
-            ]
-        }
-
-        options = configs.get(dimension, configs["platform"])
-        items = []
-        for label, weight, roas in options:
-            spend = round(total_spend * weight, 2)
-            revenue = round(spend * roas, 2)
-            purchases = int(kpis.purchases * weight)
-            impressions = int(kpis.impressions * weight)
-            clicks = int(kpis.clicks * weight)
-            ctr = round((clicks / impressions) * 100, 2) if impressions > 0 else 2.5
-            cpa = round(spend / purchases, 2) if purchases > 0 else 22.0
-
-            items.append(BreakdownItem(
-                dimension=dimension,
-                label=label,
-                spend=spend,
-                revenue=revenue,
-                roas=roas,
-                purchases=purchases,
-                impressions=impressions,
-                clicks=clicks,
-                ctr=ctr,
-                cpa=cpa,
-                percentage=round(weight * 100, 1)
-            ))
-        return items
+        The current Insight schema does not persist Meta breakdown dimensions
+        such as platform, device, age, gender, or geography. Returning
+        hardcoded percentages here would fabricate data, so unsupported
+        dimensions return an empty result until the sync layer stores those
+        breakdowns explicitly.
+        """
+        # No breakdown dimension is persisted by the current Insight model.
+        # Never manufacture percentages or demographic/platform data.
+        return []
 
     @classmethod
-    async def get_time_performance(cls, db: AsyncSession, granularity: str) -> List[TimePerformanceItem]:
-        kpis = await cls.get_kpis(db=db)
+    async def get_time_performance(
+        cls,
+        db: AsyncSession,
+        granularity: str,
+    ) -> List[TimePerformanceItem]:
+        """
+        Build time performance from stored campaign-level Meta Insights.
 
-        if granularity == "hourly":
-            base_spend = kpis.spend / 24.0 if kpis.spend > 0 else 180.0
-            items = []
-            for hour in range(24):
-                mult = 0.3 if hour < 6 else (1.2 if 11 <= hour <= 20 else 0.8)
-                spend = round(base_spend * mult, 2)
-                rev = round(spend * (4.5 if 11 <= hour <= 20 else 3.8), 2)
-                roas = round(rev / spend, 2) if spend > 0 else 0.0
-                clicks = int(spend * 1.2)
-                impressions = clicks * 35
-                purchases = int(spend / 24.0)
+        Unsupported granularities return an empty result rather than
+        fabricating hourly/weekly/monthly data.
+        """
+        granularity = granularity.lower().strip()
 
-                items.append(TimePerformanceItem(
-                    period=f"{hour:02d}:00",
+        if granularity != "daily":
+            return []
+
+        end_date = datetime.date.today()
+        start_date = end_date - datetime.timedelta(days=6)
+
+        stmt = (
+            select(
+                InsightModel.date_start,
+                func.coalesce(func.sum(InsightModel.spend), 0.0).label("spend"),
+                func.coalesce(func.sum(InsightModel.revenue), 0.0).label("revenue"),
+                func.coalesce(func.sum(InsightModel.purchases), 0).label("purchases"),
+                func.coalesce(func.sum(InsightModel.clicks), 0).label("clicks"),
+                func.coalesce(func.sum(InsightModel.impressions), 0).label("impressions"),
+            )
+            .where(
+                cls._campaign_level_filter(),
+                InsightModel.date_start >= start_date.isoformat(),
+                InsightModel.date_start <= end_date.isoformat(),
+            )
+            .group_by(InsightModel.date_start)
+            .order_by(InsightModel.date_start)
+        )
+
+        result = await db.execute(stmt)
+        rows = result.all()
+
+        items = []
+
+        for row in rows:
+            spend = float(row.spend or 0)
+            revenue = float(row.revenue or 0)
+            purchases = int(row.purchases or 0)
+            clicks = int(row.clicks or 0)
+            impressions = int(row.impressions or 0)
+
+            roas = round(revenue / spend, 2) if spend > 0 else 0.0
+            ctr = (
+                round((clicks / impressions) * 100, 2)
+                if impressions > 0
+                else 0.0
+            )
+            cpa = (
+                round(spend / purchases, 2)
+                if purchases > 0
+                else 0.0
+            )
+
+            items.append(
+                TimePerformanceItem(
+                    period=str(row.date_start)[:10],
                     spend=spend,
-                    revenue=rev,
+                    revenue=revenue,
                     roas=roas,
                     purchases=purchases,
                     clicks=clicks,
                     impressions=impressions,
-                    ctr=round((clicks / max(impressions, 1)) * 100, 2),
-                    cpa=round(spend / max(purchases, 1), 2)
-                ))
-            return items
+                    ctr=ctr,
+                    cpa=cpa,
+                )
+            )
 
-        elif granularity == "weekly":
-            base_spend = kpis.spend / 4.0 if kpis.spend > 0 else 2500.0
-            items = []
-            for w in range(1, 5):
-                spend = round(base_spend * (0.85 + w * 0.05), 2)
-                rev = round(spend * (4.2 + w * 0.1), 2)
-                roas = round(rev / spend, 2) if spend > 0 else 0.0
-                purchases = int(kpis.purchases / 4.0)
-                clicks = int(kpis.clicks / 4.0)
-                impressions = int(kpis.impressions / 4.0)
+        return items
 
-                items.append(TimePerformanceItem(
-                    period=f"Week {w}",
-                    spend=spend,
-                    revenue=rev,
-                    roas=roas,
-                    purchases=purchases,
-                    clicks=clicks,
-                    impressions=impressions,
-                    ctr=kpis.ctr,
-                    cpa=kpis.cpa
-                ))
-            return items
-
-        elif granularity == "monthly":
-            months = ["Feb", "Mar", "Apr", "May", "Jun", "Jul"]
-            base_spend = kpis.spend / 6.0 if kpis.spend > 0 else 5000.0
-            items = []
-            for idx, m in enumerate(months):
-                spend = round(base_spend * (0.8 + idx * 0.08), 2)
-                rev = round(spend * (4.0 + idx * 0.15), 2)
-                roas = round(rev / spend, 2) if spend > 0 else 0.0
-                purchases = int(kpis.purchases / 6.0)
-                clicks = int(kpis.clicks / 6.0)
-                impressions = int(kpis.impressions / 6.0)
-
-                items.append(TimePerformanceItem(
-                    period=m,
-                    spend=spend,
-                    revenue=rev,
-                    roas=roas,
-                    purchases=purchases,
-                    clicks=clicks,
-                    impressions=impressions,
-                    ctr=kpis.ctr,
-                    cpa=kpis.cpa
-                ))
-            return items
-
-        else: # daily
-            today = datetime.date.today()
-            base_spend = kpis.spend / 7.0 if kpis.spend > 0 else 600.0
-            items = []
-            for i in range(6, -1, -1):
-                day_date = (today - datetime.timedelta(days=i)).strftime("%Y-%m-%d")
-                spend = round(base_spend * (0.9 + (i % 3) * 0.1), 2)
-                rev = round(spend * 4.4, 2)
-                roas = round(rev / spend, 2) if spend > 0 else 0.0
-                purchases = int(kpis.purchases / 7.0)
-                clicks = int(kpis.clicks / 7.0)
-                impressions = int(kpis.impressions / 7.0)
-
-                items.append(TimePerformanceItem(
-                    period=day_date,
-                    spend=spend,
-                    revenue=rev,
-                    roas=roas,
-                    purchases=purchases,
-                    clicks=clicks,
-                    impressions=impressions,
-                    ctr=kpis.ctr,
-                    cpa=kpis.cpa
-                ))
-            return items
 
 dashboard_service = DashboardService()

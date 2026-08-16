@@ -1,5 +1,4 @@
 import httpx
-import uuid
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,22 +21,96 @@ router = APIRouter(prefix="/campaigns", tags=["Campaigns"])
 META_GRAPH_URL = f"https://graph.facebook.com/{settings.META_GRAPH_API_VERSION}"
 
 async def _get_access_token(db: AsyncSession) -> str:
-    stmt = select(OAuthToken).where(OAuthToken.is_valid == True).order_by(OAuthToken.created_at.desc())
+    """Return the newest valid decrypted Meta access token.
+
+    Never fall back to a dummy token. A missing/invalid token must fail
+    explicitly so the application cannot accidentally operate on fake data.
+    """
+    stmt = (
+        select(OAuthToken)
+        .where(OAuthToken.is_valid.is_(True))
+        .order_by(OAuthToken.created_at.desc())
+        .limit(1)
+    )
     res = await db.execute(stmt)
     tok = res.scalar_one_or_none()
-    return decrypt_token(tok.encrypted_access_token) if tok else "EAAG_DUMMY_TOKEN"
 
-async def _call_meta_api_update(campaign_id: str, payload: dict, access_token: str) -> bool:
-    """Helper to post updates directly to Meta Marketing API."""
-    url = f"{META_GRAPH_URL}/{campaign_id}"
-    params = {"access_token": access_token}
-    params.update(payload)
+    if not tok:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "No valid Meta access token found. "
+                "Connect a Meta ad account before performing this action."
+            ),
+        )
+
     try:
-        async with httpx.AsyncClient() as client:
-            res = await client.post(url, params=params, timeout=10.0)
-            return res.status_code == 200
-    except Exception:
-        return False
+        token = decrypt_token(tok.encrypted_access_token)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unable to decrypt the stored Meta access token.",
+        ) from exc
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Stored Meta access token is empty.",
+        )
+
+    return token
+
+async def _call_meta_api_update(
+    campaign_id: str,
+    payload: dict,
+    access_token: str,
+) -> bool:
+    """Update a campaign in Meta and fail loudly when Meta rejects the change."""
+    if not campaign_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Meta campaign ID is required.",
+        )
+
+    url = f"{META_GRAPH_URL}/{campaign_id}"
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=5.0)
+        ) as client:
+            response = await client.post(
+                url,
+                params={
+                    "access_token": access_token,
+                    **payload,
+                },
+            )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Meta Graph API request timed out.",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Unable to reach Meta Graph API: {exc}",
+        ) from exc
+
+    if response.status_code < 200 or response.status_code >= 300:
+        try:
+            error_body = response.json()
+        except ValueError:
+            error_body = {"message": response.text[:500]}
+
+        error = error_body.get("error", {}) if isinstance(error_body, dict) else {}
+        message = error.get("message") or "Meta Graph API rejected the request."
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Meta API error: {message}",
+        )
+
+    return True
 
 @router.get("", response_model=List[CampaignResponse])
 async def list_campaigns(
@@ -106,40 +179,27 @@ async def get_campaign(campaign_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Campaign not found")
     return campaign
 
-@router.post("", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
-async def create_campaign(campaign_in: CampaignCreate, db: AsyncSession = Depends(get_db)):
-    db_campaign = CampaignModel(
-        campaign_id=campaign_in.campaign_id,
-        name=campaign_in.name,
-        status=campaign_in.status,
-        objective=campaign_in.objective,
-        buying_type=campaign_in.buying_type,
-        daily_budget=campaign_in.daily_budget,
-        lifetime_budget=campaign_in.lifetime_budget
+@router.post("", response_model=CampaignResponse, status_code=status.HTTP_501_NOT_IMPLEMENTED)
+async def create_campaign(
+    campaign_in: CampaignCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Campaign creation is intentionally disabled until the real Meta campaign
+    creation flow is configured.
+
+    This prevents local-only campaign rows that do not exist in Meta Ads
+    Manager and would later appear as real campaigns in the dashboard.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=(
+            "Campaign creation is disabled until the Meta campaign creation "
+            "flow is configured for a connected ad account. No local-only "
+            "campaign is created."
+        ),
     )
-    db.add(db_campaign)
-    
-    # Audit log
-    audit = AuditLog(
-        user_id="usr_admin",
-        campaign_id=campaign_in.campaign_id,
-        action="create",
-        new_value=f"Created {campaign_in.name}",
-        result="SUCCESS"
-    )
-    db.add(audit)
-    
-    await db.commit()
-    await db.refresh(db_campaign)
-    
-    invalidate_dashboard_cache()
-    
-    await ws_manager.broadcast({
-        "event": "campaign_created",
-        "data": {"campaign_id": db_campaign.campaign_id, "name": db_campaign.name}
-    })
-    
-    return db_campaign
+
 
 @router.patch("/{campaign_id}", response_model=CampaignResponse)
 async def patch_campaign(campaign_id: str, campaign_in: CampaignUpdate, db: AsyncSession = Depends(get_db)):
@@ -177,7 +237,7 @@ async def patch_campaign(campaign_id: str, campaign_in: CampaignUpdate, db: Asyn
     new_val = f"Name: {campaign.name}, Status: {campaign.status}, Daily Budget: ${campaign.daily_budget}"
 
     audit = AuditLog(
-        user_id="usr_admin",
+        user_id=None,
         campaign_id=campaign.campaign_id,
         action="update",
         old_value=old_val,
@@ -215,7 +275,7 @@ async def pause_campaign(campaign_id: str, db: AsyncSession = Depends(get_db)):
     campaign.status = "PAUSED"
 
     audit = AuditLog(
-        user_id="usr_admin",
+        user_id=None,
         campaign_id=campaign.campaign_id,
         action="pause",
         old_value=old_status,
@@ -253,7 +313,7 @@ async def resume_campaign(campaign_id: str, db: AsyncSession = Depends(get_db)):
     campaign.status = "ACTIVE"
 
     audit = AuditLog(
-        user_id="usr_admin",
+        user_id=None,
         campaign_id=campaign.campaign_id,
         action="resume",
         old_value=old_status,
@@ -275,53 +335,26 @@ async def resume_campaign(campaign_id: str, db: AsyncSession = Depends(get_db)):
     return campaign
 
 @router.post("/{campaign_id}/duplicate", response_model=CampaignResponse)
-async def duplicate_campaign(campaign_id: str, db: AsyncSession = Depends(get_db)):
-    stmt = select(CampaignModel).where(
-        (CampaignModel.id == campaign_id) | (CampaignModel.campaign_id == campaign_id)
+async def duplicate_campaign(
+    campaign_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Duplicate a campaign only through a real Meta campaign-creation flow.
+
+    The previous implementation generated a synthetic campaign ID locally.
+    That created records which did not exist in Meta and could later be
+    mistaken for real campaigns. Until the Meta campaign-creation payload
+    is explicitly implemented for the connected ad account, fail safely.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=(
+            "Campaign duplication is disabled until the Meta campaign "
+            "creation flow is configured. No synthetic campaign is created."
+        ),
     )
-    result = await db.execute(stmt)
-    campaign = result.scalar_one_or_none()
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
 
-    new_cid = f"1202{uuid.uuid4().hex[:10]}"
-    dup_campaign = CampaignModel(
-        campaign_id=new_cid,
-        name=f"{campaign.name} (Copy)",
-        status="PAUSED",
-        objective=campaign.objective,
-        buying_type=campaign.buying_type,
-        daily_budget=campaign.daily_budget,
-        lifetime_budget=campaign.lifetime_budget,
-        spend=0.0,
-        revenue=0.0,
-        roas=0.0,
-        ctr=0.0,
-        purchases=0
-    )
-    db.add(dup_campaign)
-
-    audit = AuditLog(
-        user_id="usr_admin",
-        campaign_id=new_cid,
-        action="duplicate",
-        old_value=campaign.campaign_id,
-        new_value=new_cid,
-        result="SUCCESS"
-    )
-    db.add(audit)
-
-    await db.commit()
-    await db.refresh(dup_campaign)
-
-    invalidate_dashboard_cache()
-
-    await ws_manager.broadcast({
-        "event": "campaign_created",
-        "data": {"campaign_id": dup_campaign.campaign_id, "name": dup_campaign.name}
-    })
-
-    return dup_campaign
 
 @router.post("/{campaign_id}/rename", response_model=CampaignResponse)
 async def rename_campaign(campaign_id: str, req: CampaignRenameRequest, db: AsyncSession = Depends(get_db)):
@@ -340,7 +373,7 @@ async def rename_campaign(campaign_id: str, req: CampaignRenameRequest, db: Asyn
     campaign.name = req.name
 
     audit = AuditLog(
-        user_id="usr_admin",
+        user_id=None,
         campaign_id=campaign.campaign_id,
         action="rename",
         old_value=old_name,
@@ -378,7 +411,7 @@ async def archive_campaign(campaign_id: str, db: AsyncSession = Depends(get_db))
     campaign.status = "ARCHIVED"
 
     audit = AuditLog(
-        user_id="usr_admin",
+        user_id=None,
         campaign_id=campaign.campaign_id,
         action="archive",
         old_value=old_status,
@@ -409,7 +442,7 @@ async def increase_campaign_budget(campaign_id: str, req: CampaignBudgetActionRe
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    old_budget = campaign.daily_budget or 100.0
+    old_budget = float(campaign.daily_budget or 0.0)
     new_budget = old_budget
 
     if req.percentage is not None:
@@ -419,7 +452,7 @@ async def increase_campaign_budget(campaign_id: str, req: CampaignBudgetActionRe
     elif req.daily_budget is not None:
         new_budget = req.daily_budget
 
-    new_budget = round(max(1.0, new_budget), 2)
+    new_budget = round(max(0.0, new_budget), 2)
 
     token = await _get_access_token(db)
     await _call_meta_api_update(campaign.campaign_id, {"daily_budget": str(int(new_budget * 100))}, token)
@@ -427,7 +460,7 @@ async def increase_campaign_budget(campaign_id: str, req: CampaignBudgetActionRe
     campaign.daily_budget = new_budget
 
     audit = AuditLog(
-        user_id="usr_admin",
+        user_id=None,
         campaign_id=campaign.campaign_id,
         action="budget_increase",
         old_value=str(old_budget),
@@ -458,7 +491,7 @@ async def decrease_campaign_budget(campaign_id: str, req: CampaignBudgetActionRe
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    old_budget = campaign.daily_budget or 100.0
+    old_budget = float(campaign.daily_budget or 0.0)
     new_budget = old_budget
 
     if req.percentage is not None:
@@ -468,7 +501,7 @@ async def decrease_campaign_budget(campaign_id: str, req: CampaignBudgetActionRe
     elif req.daily_budget is not None:
         new_budget = req.daily_budget
 
-    new_budget = round(max(1.0, new_budget), 2)
+    new_budget = round(max(0.0, new_budget), 2)
 
     token = await _get_access_token(db)
     await _call_meta_api_update(campaign.campaign_id, {"daily_budget": str(int(new_budget * 100))}, token)
@@ -476,7 +509,7 @@ async def decrease_campaign_budget(campaign_id: str, req: CampaignBudgetActionRe
     campaign.daily_budget = new_budget
 
     audit = AuditLog(
-        user_id="usr_admin",
+        user_id=None,
         campaign_id=campaign.campaign_id,
         action="budget_decrease",
         old_value=str(old_budget),
@@ -516,7 +549,7 @@ async def edit_campaign_budget(campaign_id: str, req: CampaignBudgetActionReques
     campaign.daily_budget = new_budget
 
     audit = AuditLog(
-        user_id="usr_admin",
+        user_id=None,
         campaign_id=campaign.campaign_id,
         action="budget_edit",
         old_value=str(old_budget),
@@ -579,8 +612,13 @@ async def bulk_campaign_action(req: BulkCampaignActionRequest, db: AsyncSession 
             new_val = str(new_budget)
             audit_action = "bulk_budget_update"
         elif req.action == "increase_budget":
-            pct = req.percentage or 10.0
-            new_budget = round((campaign.daily_budget or 100.0) * (1 + pct / 100.0), 2)
+            pct = req.percentage
+            if pct is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="percentage is required for increase_budget.",
+                )
+            new_budget = round((campaign.daily_budget or 0.0) * (1 + pct / 100.0), 2)
             await _call_meta_api_update(
                 campaign.campaign_id,
                 {"daily_budget": str(int(new_budget * 100))},
@@ -590,8 +628,13 @@ async def bulk_campaign_action(req: BulkCampaignActionRequest, db: AsyncSession 
             new_val = str(new_budget)
             audit_action = "bulk_budget_increase"
         elif req.action == "decrease_budget":
-            pct = req.percentage or 10.0
-            new_budget = round(max(1.0, (campaign.daily_budget or 100.0) * (1 - pct / 100.0)), 2)
+            pct = req.percentage
+            if pct is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="percentage is required for decrease_budget.",
+                )
+            new_budget = round(max(0.0, (campaign.daily_budget or 0.0) * (1 - pct / 100.0)), 2)
             await _call_meta_api_update(
                 campaign.campaign_id,
                 {"daily_budget": str(int(new_budget * 100))},
@@ -601,14 +644,18 @@ async def bulk_campaign_action(req: BulkCampaignActionRequest, db: AsyncSession 
             new_val = str(new_budget)
             audit_action = "bulk_budget_decrease"
         elif req.action == "delete":
-            await db.delete(campaign)
-            new_val = "DELETED"
-            audit_action = "bulk_delete"
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail=(
+                    "Bulk local-only campaign deletion is disabled. "
+                    "Delete/archive campaigns through Meta and sync the result."
+                ),
+            )
         else:
             continue
 
         audit = AuditLog(
-            user_id="usr_admin",
+            user_id=None,
             campaign_id=campaign.campaign_id,
             action=audit_action,
             old_value=old_val,
@@ -628,31 +675,20 @@ async def bulk_campaign_action(req: BulkCampaignActionRequest, db: AsyncSession 
 
     return {"status": "success", "updated_records": updated_count}
 
-@router.delete("/{campaign_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_campaign(campaign_id: str, db: AsyncSession = Depends(get_db)):
-    stmt = select(CampaignModel).where(
-        (CampaignModel.id == campaign_id) | (CampaignModel.campaign_id == campaign_id)
+@router.delete("/{campaign_id}", status_code=status.HTTP_501_NOT_IMPLEMENTED)
+async def delete_campaign(
+    campaign_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Local-only deletion is disabled to prevent PostgreSQL and Meta from
+    becoming inconsistent. Use Meta's supported campaign lifecycle operation
+    and then let the sync layer reconcile the database.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=(
+            "Local-only campaign deletion is disabled. Campaign lifecycle "
+            "changes must be performed through Meta and reconciled by sync."
+        ),
     )
-    result = await db.execute(stmt)
-    campaign = result.scalar_one_or_none()
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-
-    cid = campaign.campaign_id
-    await db.delete(campaign)
-
-    audit = AuditLog(
-        user_id="usr_admin",
-        campaign_id=cid,
-        action="delete",
-        result="SUCCESS"
-    )
-    db.add(audit)
-
-    await db.commit()
-    invalidate_dashboard_cache()
-
-    await ws_manager.broadcast({
-        "event": "campaign_deleted",
-        "data": {"campaign_id": cid}
-    })

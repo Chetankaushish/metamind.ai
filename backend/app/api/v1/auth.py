@@ -147,7 +147,7 @@ async def register_user(
         action="USER_REGISTER_SUCCESS",
         resource_type="user",
         resource_id=new_user.id,
-        ip_address=request.client.host if request.client else "127.0.0.1",
+        ip_address=request.client.host if request.client else None,
         details={"email": new_user.email, "org_id": new_org.id}
     )
     db.add(audit)
@@ -165,7 +165,7 @@ async def register_user(
     # Register Active User Session
     ua = request.headers.get("User-Agent", "Browser")
     ua_info = _parse_user_agent(ua)
-    ip_addr = request.client.host if request.client else "127.0.0.1"
+    ip_addr = request.client.host if request.client else None
 
     now = datetime.datetime.now(datetime.timezone.utc)
     user_session = UserSession(
@@ -176,7 +176,6 @@ async def register_user(
         device_type=ua_info["device_type"],
         browser=ua_info["browser"],
         ip_address=ip_addr,
-        country="United States",
         is_trusted=True,
         expires_at=now + datetime.timedelta(days=7),
         is_revoked=False
@@ -227,7 +226,7 @@ async def user_login(
     res = await db.execute(stmt)
     user = res.scalar_one_or_none()
 
-    ip_addr = request.client.host if request.client else "127.0.0.1"
+    ip_addr = request.client.host if request.client else None
 
     if not user or not verify_password(payload.password, user.hashed_password):
         audit = AuditLog(
@@ -249,7 +248,9 @@ async def user_login(
     stmt_org = select(OrganizationMember).where(OrganizationMember.user_id == user.id)
     res_org = await db.execute(stmt_org)
     member = res_org.scalars().first()
-    org_id = member.organization_id if member else "org_default"
+    if not member:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User organization membership not found.")
+    org_id = member.organization_id
 
     # Issue Tokens
     token_payload = {
@@ -274,7 +275,6 @@ async def user_login(
         device_type=ua_info["device_type"],
         browser=ua_info["browser"],
         ip_address=ip_addr,
-        country="United States",
         is_trusted=True,
         expires_at=now + datetime.timedelta(days=7),
         is_revoked=False
@@ -393,7 +393,9 @@ async def refresh_access_token(
 
     stmt_org = select(OrganizationMember).where(OrganizationMember.user_id == user.id)
     member = (await db.execute(stmt_org)).scalars().first()
-    org_id = member.organization_id if member else "org_default"
+    if not member:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User organization membership not found.")
+    org_id = member.organization_id
 
     new_access_token = create_access_token({
         "sub": user.id,
@@ -421,17 +423,7 @@ async def get_current_user_profile(
     user = res.scalar_one_or_none()
 
     if not user:
-        # Fallback for default seed admin
-        return {
-            "id": tenant_ctx.user_id,
-            "email": "admin@metamind.ai",
-            "full_name": "Executive Admin",
-            "role": "Admin",
-            "company_name": "MetaMind AI Core",
-            "plan": "Enterprise",
-            "organization_id": tenant_ctx.organization_id,
-            "is_verified": True
-        }
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User account not found.")
 
     return {
         "id": user.id,
@@ -465,7 +457,7 @@ async def forgot_password(
     user.reset_token_expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
 
     audit = AuditLog(
-        organization_id="org_default",
+        organization_id=(await db.execute(select(OrganizationMember.organization_id).where(OrganizationMember.user_id == user.id))).scalar(),
         user_id=user.id,
         action="FORGOT_PASSWORD_REQUESTED",
         resource_type="user",
@@ -507,7 +499,7 @@ async def reset_password(
         sess.is_revoked = True
 
     audit = AuditLog(
-        organization_id="org_default",
+        organization_id=(await db.execute(select(OrganizationMember.organization_id).where(OrganizationMember.user_id == user.id))).scalar(),
         user_id=user.id,
         action="PASSWORD_RESET_SUCCESS",
         resource_type="user"
@@ -568,7 +560,7 @@ async def verify_email(
     user.verification_token = None
 
     audit = AuditLog(
-        organization_id="org_default",
+        organization_id=(await db.execute(select(OrganizationMember.organization_id).where(OrganizationMember.user_id == user.id))).scalar(),
         user_id=user.id,
         action="EMAIL_VERIFIED",
         resource_type="user"
@@ -638,24 +630,74 @@ async def revoke_specific_session(
 # Meta OAuth & Account Integration Routes
 # =============================================================================
 
+
+def _require_meta_oauth_settings() -> tuple[str, str, str]:
+    """Return required Meta OAuth settings; fail fast when configuration is missing."""
+    app_id = settings.META_APP_ID
+    app_secret = settings.META_APP_SECRET
+    redirect_uri = settings.META_REDIRECT_URI
+
+    if not app_id or not app_secret or not redirect_uri:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Meta OAuth is not configured. Set META_APP_ID, META_APP_SECRET and META_REDIRECT_URI.",
+        )
+
+    return app_id, app_secret, redirect_uri
+
+
+def _normalize_ad_account_id(value: Optional[str]) -> Optional[str]:
+    """Normalize Meta account IDs to the canonical act_<id> form."""
+    if not value:
+        return None
+    value = str(value).strip()
+    return value if value.startswith("act_") else f"act_{value}"
+
+
+def _meta_account_status(raw_status: Any) -> str:
+    """Translate Meta's numeric account status into a stable application status."""
+    status_map = {
+        1: "active",
+        2: "disabled",
+        3: "unapproved",
+        7: "pending_risk_review",
+        8: "pending_closure",
+        9: "grace_period",
+        100: "pending_risk_payment",
+        101: "grace_period",
+    }
+    try:
+        return status_map.get(int(raw_status), "unknown")
+    except (TypeError, ValueError):
+        return str(raw_status or "unknown").lower()
+
+
+async def _meta_graph_error(response: httpx.Response, operation: str) -> str:
+    """Build a safe, useful error message from a Meta Graph API response."""
+    try:
+        data = response.json()
+        error = data.get("error", {}) if isinstance(data, dict) else {}
+        message = error.get("message") or data.get("message") if isinstance(data, dict) else None
+        return f"Meta {operation} failed ({response.status_code}): {message or 'Unknown Meta API error'}"
+    except Exception:
+        return f"Meta {operation} failed with HTTP {response.status_code}."
+
+
 @router.post("/auth/meta/login", response_model=MetaLoginResponse, tags=["Meta OAuth"])
 async def meta_oauth_login():
-    """
-    Initiate Meta Login OAuth flow with anti-CSRF state token.
-    """
-    app_id = settings.META_APP_ID or "1092840192840"
-    redirect_uri = getattr(settings, "META_REDIRECT_URI", None) or "http://localhost:3000/api/v1/auth/meta/callback"
-    state = secrets.token_urlsafe(16)
-
-    print("META_APP_ID =", settings.META_APP_ID)
-    print("META_REDIRECT_URI =", redirect_uri)
-    print("META_GRAPH_API_VERSION =", settings.META_GRAPH_API_VERSION)
+    """Initiate the Meta OAuth flow using only configured application credentials."""
+    app_id, _, redirect_uri = _require_meta_oauth_settings()
+    state = secrets.token_urlsafe(32)
 
     if redis_client:
         try:
             await redis_client.setex(f"oauth_state:{state}", 600, "valid")
-        except Exception as e:
-            logger.warning("oauth_state_redis_save_failed", error=str(e))
+        except Exception as exc:
+            logger.warning("oauth_state_redis_save_failed", error=str(exc))
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="OAuth state storage is unavailable. Please try again.",
+            ) from exc
 
     scope_str = ",".join(SCOPES)
     auth_url = (
@@ -666,10 +708,10 @@ async def meta_oauth_login():
         f"&scope={scope_str}"
         f"&response_type=code"
     )
-    print("AUTH_URL =", auth_url)
 
     logger.info("meta_oauth_login_initiated", app_id=app_id, redirect_uri=redirect_uri)
     return MetaLoginResponse(authorization_url=auth_url, state=state)
+
 
 @router.get("/auth/meta/callback", response_class=HTMLResponse, tags=["Meta OAuth"])
 async def meta_oauth_callback(
@@ -677,126 +719,148 @@ async def meta_oauth_callback(
     state: Optional[str] = Query(None),
     error: Optional[str] = Query(None),
     error_description: Optional[str] = Query(None),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     """
-    OAuth Callback handler: Exchanges authorization code for long-lived access token,
-    encrypts token using Fernet, stores record in database, and notifies client window.
+    Exchange the Meta authorization code, fetch the real Meta user/business/ad-account
+    data, encrypt the token, and persist everything in PostgreSQL.
     """
-    if state and redis_client:
+    if error:
+        safe_error = html.escape(error_description or error)
+        return HTMLResponse(
+            content=f"<h2>Meta Authentication Failed</h2><p>{safe_error}</p>",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if not code or not state:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing Meta OAuth code or state parameter.",
+        )
+
+    if redis_client:
         try:
             valid = await redis_client.get(f"oauth_state:{state}")
             if not valid:
-                logger.warning("meta_oauth_invalid_state", state=state)
-        except Exception as e:
-            logger.warning("oauth_state_redis_check_failed", error=str(e))
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid or expired OAuth state.",
+                )
+            await redis_client.delete(f"oauth_state:{state}")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("oauth_state_redis_check_failed", error=str(exc))
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="OAuth state validation is unavailable. Please try again.",
+            ) from exc
 
-    if error:
-        safe_error = html.escape(error or "")
-        safe_desc = html.escape(error_description or error or "")
-        html_content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head><title>Meta Authentication Error</title></head>
-        <body style="font-family: sans-serif; text-align: center; padding: 50px; background: #0f172a; color: #f8fafc;">
-            <h2>Authentication Failed</h2>
-            <p>{safe_desc}</p>
-            <script>
-                if (window.opener) {{
-                    window.opener.postMessage({{ type: 'META_AUTH_ERROR', error: '{safe_error}' }}, '*');
-                    setTimeout(() => window.close(), 2000);
-                }}
-            </script>
-        </body>
-        </html>
-        """
-        return HTMLResponse(content=html_content, status_code=400)
+    app_id, app_secret, redirect_uri = _require_meta_oauth_settings()
+    graph_version = settings.META_GRAPH_API_VERSION
+    token_url = f"https://graph.facebook.com/{graph_version}/oauth/access_token"
 
-    if not code:
-        raise HTTPException(status_code=400, detail="Missing authorization code parameter.")
-
-    app_id = settings.META_APP_ID or "1092840192840"
-    app_secret = settings.META_APP_SECRET or "dummy_app_secret"
-    redirect_uri = getattr(settings, "META_REDIRECT_URI", None) or "http://localhost:3000/api/v1/auth/meta/callback"
-
-    short_token = ""
-    long_token = ""
-    meta_user_id = ""
-    meta_user_name = "Volzad Admin"
-    meta_user_email = "admin@volzad.com"
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            token_url = f"https://graph.facebook.com/{settings.META_GRAPH_API_VERSION}/oauth/access_token"
-            token_params = {
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        token_res = await client.get(
+            token_url,
+            params={
                 "client_id": app_id,
                 "redirect_uri": redirect_uri,
                 "client_secret": app_secret,
-                "code": code
-            }
-            token_res = await client.get(token_url, params=token_params)
+                "code": code,
+            },
+        )
+        if token_res.status_code != 200:
+            detail = await _meta_graph_error(token_res, "authorization-code exchange")
+            logger.error("meta_oauth_code_exchange_failed", status=token_res.status_code)
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail)
 
-            if token_res.status_code == 200:
-                token_data = token_res.json()
-                short_token = token_data.get("access_token", "")
+        short_token = token_res.json().get("access_token")
+        if not short_token:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Meta did not return an access token.",
+            )
 
-                long_params = {
-                    "grant_type": "fb_exchange_token",
-                    "client_id": app_id,
-                    "client_secret": app_secret,
-                    "fb_exchange_token": short_token
-                }
-                long_res = await client.get(token_url, params=long_params)
-                if long_res.status_code == 200:
-                    long_token = long_res.json().get("access_token", short_token)
-                else:
-                    long_token = short_token
+        long_res = await client.get(
+            token_url,
+            params={
+                "grant_type": "fb_exchange_token",
+                "client_id": app_id,
+                "client_secret": app_secret,
+                "fb_exchange_token": short_token,
+            },
+        )
+        if long_res.status_code != 200:
+            detail = await _meta_graph_error(long_res, "long-lived token exchange")
+            logger.error("meta_long_lived_token_exchange_failed", status=long_res.status_code)
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail)
 
-                me_url = f"https://graph.facebook.com/{settings.META_GRAPH_API_VERSION}/me"
-                me_res = await client.get(me_url, params={"fields": "id,name,email", "access_token": long_token})
-                if me_res.status_code == 200:
-                    me_data = me_res.json()
-                    meta_user_id = me_data.get("id", "meta_usr_109284")
-                    meta_user_name = me_data.get("name", meta_user_name)
-                    meta_user_email = me_data.get("email", meta_user_email)
+        long_token = long_res.json().get("access_token")
+        if not long_token:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Meta did not return a long-lived access token.",
+            )
 
-                # Fetch Business Managers from Meta Graph API
-                bm_url = f"https://graph.facebook.com/{settings.META_GRAPH_API_VERSION}/me/businesses"
-                bm_res = await client.get(bm_url, params={"fields": "id,name,verification_status", "access_token": long_token})
-                fetched_bms = bm_res.json().get("data", []) if bm_res.status_code == 200 else []
+        me_res = await client.get(
+            f"https://graph.facebook.com/{graph_version}/me",
+            params={"fields": "id,name,email", "access_token": long_token},
+        )
+        if me_res.status_code != 200:
+            detail = await _meta_graph_error(me_res, "user profile fetch")
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail)
 
-                # Fetch Ad Accounts from Meta Graph API
-                ad_url = f"https://graph.facebook.com/{settings.META_GRAPH_API_VERSION}/me/adaccounts"
-                ad_res = await client.get(ad_url, params={"fields": "id,name,account_id,currency,timezone,account_status,spend_cap,amount_spent,business", "access_token": long_token})
-                fetched_ads = ad_res.json().get("data", []) if ad_res.status_code == 200 else []
+        me_data = me_res.json()
+        meta_user_id = me_data.get("id")
+        if not meta_user_id:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Meta user ID was not returned by the Graph API.",
+            )
 
-            else:
-                meta_user_id = f"meta_usr_{secrets.token_hex(4)}"
-                long_token = f"EAAG{secrets.token_urlsafe(32)}9420xZ19"
-                fetched_bms = []
-                fetched_ads = []
+        meta_user_name = me_data.get("name") or meta_user_id
+        meta_user_email = me_data.get("email")
 
-    except Exception as e:
-        logger.warning("meta_oauth_graph_api_fallback", error=str(e))
-        meta_user_id = f"meta_usr_{secrets.token_hex(4)}"
-        long_token = f"EAAG{secrets.token_urlsafe(32)}9420xZ19"
-        fetched_bms = []
-        fetched_ads = []
+        bm_res = await client.get(
+            f"https://graph.facebook.com/{graph_version}/me/businesses",
+            params={
+                "fields": "id,name,verification_status",
+                "access_token": long_token,
+            },
+        )
+        if bm_res.status_code != 200:
+            detail = await _meta_graph_error(bm_res, "business manager fetch")
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail)
+        fetched_bms = bm_res.json().get("data", [])
+
+        ad_res = await client.get(
+            f"https://graph.facebook.com/{graph_version}/me/adaccounts",
+            params={
+                "fields": "id,name,account_id,currency,timezone,account_status,spend_cap,amount_spent,business",
+                "access_token": long_token,
+            },
+        )
+        if ad_res.status_code != 200:
+            detail = await _meta_graph_error(ad_res, "ad account fetch")
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail)
+        fetched_ads = ad_res.json().get("data", [])
 
     encrypted_tok = encrypt_token(long_token)
+
+    # Meta's long-lived user token lifetime is returned by the token exchange when
+    # available. Keep a conservative application-side expiry for the stored record.
     expires_datetime = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=60)
 
-    # Upsert Meta Account
     account_stmt = select(MetaAccount).where(MetaAccount.meta_user_id == meta_user_id)
-    acc_result = await db.execute(account_stmt)
-    meta_acc = acc_result.scalar_one_or_none()
+    meta_acc = (await db.execute(account_stmt)).scalar_one_or_none()
 
     if not meta_acc:
         meta_acc = MetaAccount(
             meta_user_id=meta_user_id,
             name=meta_user_name,
             email=meta_user_email,
-            connection_status="connected"
+            connection_status="connected",
         )
         db.add(meta_acc)
         await db.flush()
@@ -805,135 +869,126 @@ async def meta_oauth_callback(
         meta_acc.name = meta_user_name
         meta_acc.email = meta_user_email
 
-    # Store OAuth token record
-    token_record = OAuthToken(
-        meta_account_id=meta_acc.id,
-        encrypted_access_token=encrypted_tok,
-        token_type="long_lived_user",
-        scopes=SCOPES,
-        expires_at=expires_datetime,
-        is_valid=True
+    db.add(
+        OAuthToken(
+            meta_account_id=meta_acc.id,
+            encrypted_access_token=encrypted_tok,
+            token_type="long_lived_user",
+            scopes=SCOPES,
+            expires_at=expires_datetime,
+            is_valid=True,
+        )
     )
-    db.add(token_record)
 
-    # Upsert Business Managers
-    if fetched_bms:
-        for idx, b in enumerate(fetched_bms):
-            b_id = b.get("id")
-            bm_stmt = select(BusinessManager).where(BusinessManager.bm_meta_id == b_id)
-            existing_bm = (await db.execute(bm_stmt)).scalar_one_or_none()
-            if not existing_bm:
-                db.add(BusinessManager(
-                    bm_meta_id=b_id,
-                    meta_account_id=meta_acc.id,
-                    name=b.get("name", "Meta Business Manager"),
-                    verification_status=b.get("verification_status", "verified"),
-                    ad_accounts_count=1,
-                    is_primary=(idx == 0)
-                ))
-    else:
-        # Provide Business Managers for selection
-        default_bms = [
-            {"id": "bm_1092840192", "name": "Volzad Tech and Service (BM)", "status": "verified", "primary": True},
-            {"id": "bm_2093810293", "name": "MetaMind Scale Media Agency (BM)", "status": "verified", "primary": False}
-        ]
-        for dbm in default_bms:
-            bm_stmt = select(BusinessManager).where(BusinessManager.bm_meta_id == dbm["id"])
-            existing_bm = (await db.execute(bm_stmt)).scalar_one_or_none()
-            if not existing_bm:
-                db.add(BusinessManager(
-                    bm_meta_id=dbm["id"],
-                    meta_account_id=meta_acc.id,
-                    name=dbm["name"],
-                    verification_status=dbm["status"],
-                    ad_accounts_count=2,
-                    is_primary=dbm["primary"]
-                ))
+    # Upsert Business Managers from Meta. No fallback or fabricated accounts.
+    bm_db_by_meta_id: Dict[str, BusinessManager] = {}
+    for index, business in enumerate(fetched_bms):
+        bm_meta_id = business.get("id")
+        if not bm_meta_id:
+            continue
+
+        bm_stmt = select(BusinessManager).where(
+            BusinessManager.bm_meta_id == bm_meta_id
+        )
+        existing_bm = (await db.execute(bm_stmt)).scalar_one_or_none()
+
+        if existing_bm:
+            existing_bm.meta_account_id = meta_acc.id
+            existing_bm.name = business.get("name") or existing_bm.name
+            existing_bm.verification_status = business.get("verification_status") or existing_bm.verification_status
+            existing_bm.is_primary = index == 0
+            bm_db_by_meta_id[bm_meta_id] = existing_bm
+        else:
+            new_bm = BusinessManager(
+                bm_meta_id=bm_meta_id,
+                meta_account_id=meta_acc.id,
+                name=business.get("name") or bm_meta_id,
+                verification_status=business.get("verification_status") or "unknown",
+                ad_accounts_count=0,
+                is_primary=index == 0,
+            )
+            db.add(new_bm)
+            bm_db_by_meta_id[bm_meta_id] = new_bm
 
     await db.flush()
 
-    # Get Primary BM for linking
-    bm_res = await db.execute(select(BusinessManager).where(BusinessManager.meta_account_id == meta_acc.id))
-    primary_bm = bm_res.scalars().first()
-    bm_db_id = primary_bm.id if primary_bm else None
+    # Refresh the mapping with database IDs after flush.
+    if bm_db_by_meta_id:
+        bm_ids = list(bm_db_by_meta_id.keys())
+        bm_rows = (
+            await db.execute(
+                select(BusinessManager).where(BusinessManager.bm_meta_id.in_(bm_ids))
+            )
+        ).scalars().all()
+        bm_db_by_meta_id = {row.bm_meta_id: row for row in bm_rows}
 
-    # Upsert Ad Accounts
-    if fetched_ads:
-        for a in fetched_ads:
-            act_id = a.get("account_id") or a.get("id", "").replace("act_", "")
-            ad_acc_stmt = select(AdAccount).where(AdAccount.account_id == f"act_{act_id}")
-            existing_ad = (await db.execute(ad_acc_stmt)).scalar_one_or_none()
-            if not existing_ad:
-                db.add(AdAccount(
-                    account_id=f"act_{act_id}",
-                    account_name=a.get("name", "Facebook Ad Account"),
-                    meta_account_id=meta_acc.id,
-                    business_manager_id=bm_db_id,
-                    currency=a.get("currency", "USD"),
-                    timezone=a.get("timezone", "America/New_York"),
-                    spend_limit=float(a.get("spend_cap", 250000.0)),
-                    amount_spent=float(a.get("amount_spent", 0.0)),
-                    status="active" if a.get("account_status") == 1 else "active"
-                ))
-    else:
-        default_accounts = [
-            {
-                "id": "act_89201948201",
-                "name": "Facebook & IG - Main Ecom Scale US",
-                "bm_id": "bm_1092840192",
-                "currency": "USD",
-                "timezone": "America/New_York",
-                "status": "active"
-            },
-            {
-                "id": "act_98201948202",
-                "name": "Global Retargeting & Advantage+ Scale",
-                "bm_id": "bm_1092840192",
-                "currency": "USD",
-                "timezone": "America/Los_Angeles",
-                "status": "active"
-            },
-            {
-                "id": "act_77201948203",
-                "name": "EU Agency Enterprise - EUR Account",
-                "bm_id": "bm_2093810293",
-                "currency": "EUR",
-                "timezone": "Europe/London",
-                "status": "active"
-            }
-        ]
-        for dacc in default_accounts:
-            ad_acc_stmt = select(AdAccount).where(AdAccount.account_id == dacc["id"])
-            existing_ad = (await db.execute(ad_acc_stmt)).scalar_one_or_none()
-            if not existing_ad:
-                db.add(AdAccount(
-                    account_id=dacc["id"],
-                    account_name=dacc["name"],
-                    meta_account_id=meta_acc.id,
-                    business_manager_id=bm_db_id,
-                    currency=dacc["currency"],
-                    timezone=dacc["timezone"],
-                    spend_limit=250000.0,
-                    amount_spent=14500.0,
-                    status=dacc["status"]
-                ))
+    # Upsert real Meta ad accounts and associate each one with its real Business Manager.
+    for account in fetched_ads:
+        account_id = _normalize_ad_account_id(account.get("account_id") or account.get("id"))
+        if not account_id:
+            continue
+
+        business = account.get("business") or {}
+        business_meta_id = business.get("id") if isinstance(business, dict) else None
+        linked_bm = bm_db_by_meta_id.get(business_meta_id)
+
+        raw_spend_cap = account.get("spend_cap")
+        raw_amount_spent = account.get("amount_spent")
+
+        try:
+            spend_limit = float(raw_spend_cap) / 100 if raw_spend_cap is not None else 0.0
+        except (TypeError, ValueError):
+            spend_limit = 0.0
+
+        try:
+            amount_spent = float(raw_amount_spent) / 100 if raw_amount_spent is not None else 0.0
+        except (TypeError, ValueError):
+            amount_spent = 0.0
+
+        ad_acc_stmt = select(AdAccount).where(AdAccount.account_id == account_id)
+        existing_ad = (await db.execute(ad_acc_stmt)).scalar_one_or_none()
+
+        values = {
+            "account_id": account_id,
+            "account_name": account.get("name") or account_id,
+            "meta_account_id": meta_acc.id,
+            "business_manager_id": linked_bm.id if linked_bm else None,
+            "currency": account.get("currency") or "",
+            "timezone": account.get("timezone") or "",
+            "spend_limit": spend_limit,
+            "amount_spent": amount_spent,
+            "status": _meta_account_status(account.get("account_status")),
+        }
+
+        if existing_ad:
+            for field, value in values.items():
+                setattr(existing_ad, field, value)
+        else:
+            db.add(AdAccount(**values))
+
+    # Keep Business Manager account counts consistent with the real Meta payload.
+    counts: Dict[str, int] = {}
+    for account in fetched_ads:
+        business = account.get("business") or {}
+        business_meta_id = business.get("id") if isinstance(business, dict) else None
+        if business_meta_id:
+            counts[business_meta_id] = counts.get(business_meta_id, 0) + 1
+
+    for bm_meta_id, bm in bm_db_by_meta_id.items():
+        bm.ad_accounts_count = counts.get(bm_meta_id, 0)
 
     await db.commit()
 
     safe_name = html.escape(meta_user_name)
     safe_uid = html.escape(meta_user_id)
-
     html_content = f"""
     <!DOCTYPE html>
     <html>
     <head><title>Meta Authentication Successful</title></head>
-    <body style="font-family: system-ui, sans-serif; text-align: center; padding: 50px; background: #0b0f19; color: #f8fafc;">
-        <div style="background: #1e293b; border: 1px solid #334155; padding: 40px; border-radius: 12px; max-width: 480px; margin: 0 auto; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5);">
-            <div style="width: 56px; height: 56px; background: #10b98120; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 20px auto; color: #10b981; font-size: 28px;">✓</div>
-            <h2 style="margin: 0 0 10px 0; font-weight: 600;">Meta Account Connected</h2>
-            <p style="color: #94a3b8; font-size: 14px; margin-bottom: 24px;">Connected as <strong>{safe_name}</strong></p>
-            <p style="color: #64748b; font-size: 13px;">Closing window and returning to dashboard...</p>
-        </div>
+    <body style="font-family: system-ui, sans-serif; text-align: center; padding: 50px;">
+        <h2>Meta Account Connected</h2>
+        <p>Connected as <strong>{safe_name}</strong></p>
+        <p>Closing window and returning to dashboard...</p>
         <script>
             if (window.opener) {{
                 window.opener.postMessage({{ type: 'META_AUTH_SUCCESS', userId: '{safe_uid}' }}, '*');
@@ -945,158 +1000,154 @@ async def meta_oauth_callback(
     </body>
     </html>
     """
-    return HTMLResponse(content=html_content, status_code=200)
+    return HTMLResponse(content=html_content, status_code=status.HTTP_200_OK)
+
 
 @router.get("/auth/meta/status", response_model=MetaAuthStatusResponse, tags=["Meta OAuth"])
 async def get_meta_auth_status(db: AsyncSession = Depends(get_db)):
-    """
-    Retrieve current Meta OAuth connection status, token validity, expiration timestamps, and permissions.
-    """
-    account_stmt = select(MetaAccount).where(MetaAccount.connection_status == "connected").order_by(MetaAccount.created_at.desc())
-    acc_res = await db.execute(account_stmt)
-    meta_acc = acc_res.scalar_one_or_none()
+    """Return the current stored Meta connection and token status."""
+    account_stmt = (
+        select(MetaAccount)
+        .where(MetaAccount.connection_status == "connected")
+        .order_by(MetaAccount.created_at.desc())
+    )
+    meta_acc = (await db.execute(account_stmt)).scalar_one_or_none()
 
     if not meta_acc:
         return MetaAuthStatusResponse(
             connected=False,
-            masked_token="EAAG...9420xZ19",
             is_valid=False,
-            scopes=SCOPES
+            scopes=SCOPES,
         )
 
-    token_stmt = select(OAuthToken).where(OAuthToken.meta_account_id == meta_acc.id, OAuthToken.is_valid == True).order_by(OAuthToken.created_at.desc())
-    tok_res = await db.execute(token_stmt)
-    token_rec = tok_res.scalar_one_or_none()
+    token_stmt = (
+        select(OAuthToken)
+        .where(
+            OAuthToken.meta_account_id == meta_acc.id,
+            OAuthToken.is_valid == True,
+        )
+        .order_by(OAuthToken.created_at.desc())
+    )
+    token_rec = (await db.execute(token_stmt)).scalar_one_or_none()
 
-    masked = "EAAG...9420xZ19"
-    expires_str = None
-    is_valid = True
+    masked = mask_token(decrypt_token(token_rec.encrypted_access_token)) if token_rec else None
+    expires_str = token_rec.expires_at.isoformat() if token_rec and token_rec.expires_at else None
+    is_valid = bool(token_rec and token_rec.is_valid)
 
-    if token_rec:
-        plain_tok = decrypt_token(token_rec.encrypted_access_token)
-        masked = mask_token(plain_tok)
-        if token_rec.expires_at:
-            expires_str = token_rec.expires_at.isoformat()
-            if token_rec.expires_at < datetime.datetime.now(datetime.timezone.utc):
-                is_valid = False
-                meta_acc.connection_status = "expired"
-                token_rec.is_valid = False
-                await db.commit()
+    if token_rec and token_rec.expires_at and token_rec.expires_at < datetime.datetime.now(datetime.timezone.utc):
+        is_valid = False
+        meta_acc.connection_status = "expired"
+        token_rec.is_valid = False
+        await db.commit()
 
-    bm_stmt = select(BusinessManager).where(BusinessManager.meta_account_id == meta_acc.id)
+    bm_stmt = select(BusinessManager).where(
+        BusinessManager.meta_account_id == meta_acc.id,
+        BusinessManager.is_primary == True,
+    )
     bm = (await db.execute(bm_stmt)).scalar_one_or_none()
 
     ad_acc_stmt = select(AdAccount).where(AdAccount.meta_account_id == meta_acc.id)
-    ad_acc = (await db.execute(ad_acc_stmt)).scalar_one_or_none()
+    ad_acc = (await db.execute(ad_acc_stmt)).scalars().first()
 
     return MetaAuthStatusResponse(
         connected=meta_acc.connection_status == "connected",
         meta_user_id=meta_acc.meta_user_id,
         meta_user_name=meta_acc.name,
         masked_token=masked,
-        token_type="long_lived_user",
+        token_type=token_rec.token_type if token_rec else None,
         is_valid=is_valid,
-        expires_at=expires_str or "2026-09-30T23:59:59Z",
-        scopes=SCOPES,
+        expires_at=expires_str,
+        scopes=token_rec.scopes if token_rec else SCOPES,
         last_connected=meta_acc.last_connected.isoformat() if meta_acc.last_connected else None,
-        primary_business_name=bm.name if bm else "Volzad Tech and Service (BM)",
-        primary_ad_account_name=ad_acc.account_name if ad_acc else "Facebook & IG - Main Ecom Scale US"
+        primary_business_name=bm.name if bm else None,
+        primary_ad_account_name=ad_acc.account_name if ad_acc else None,
     )
 
+
 @router.post("/auth/meta/reconnect", response_model=MetaLoginResponse, tags=["Meta OAuth"])
-async def meta_oauth_reconnect(db: AsyncSession = Depends(get_db)):
-    """
-    Generate Meta OAuth re-authorization flow URL to reconnect expired or revoked access tokens.
-    """
+async def meta_oauth_reconnect():
+    """Start a fresh Meta OAuth flow for a disconnected or expired connection."""
     return await meta_oauth_login()
+
 
 @router.post("/auth/meta/logout", tags=["Meta OAuth"])
 async def meta_oauth_logout(db: AsyncSession = Depends(get_db)):
-    """
-    Disconnect active Meta account and mark stored access tokens as revoked/invalid.
-    """
+    """Disconnect the stored Meta account and invalidate its access tokens."""
     account_stmt = select(MetaAccount).where(MetaAccount.connection_status == "connected")
-    acc_res = await db.execute(account_stmt)
-    meta_accounts = acc_res.scalars().all()
+    meta_accounts = (await db.execute(account_stmt)).scalars().all()
 
-    for acc in meta_accounts:
-        acc.connection_status = "disconnected"
-        token_stmt = select(OAuthToken).where(OAuthToken.meta_account_id == acc.id)
-        tok_res = await db.execute(token_stmt)
-        tokens = tok_res.scalars().all()
-        for tok in tokens:
-            tok.is_valid = False
+    for account in meta_accounts:
+        account.connection_status = "disconnected"
+        token_stmt = select(OAuthToken).where(OAuthToken.meta_account_id == account.id)
+        tokens = (await db.execute(token_stmt)).scalars().all()
+        for token in tokens:
+            token.is_valid = False
 
     await db.commit()
     logger.info("meta_oauth_logout_completed")
     return {"status": "disconnected", "message": "Meta Business account disconnected successfully."}
 
+
 @router.get("/auth/meta/businesses", response_model=List[BusinessManagerResponse], tags=["Meta OAuth"])
 async def list_meta_businesses(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(BusinessManager))
-    bms = result.scalars().all()
-    if not bms:
-        return [
-            BusinessManagerResponse(
-                id="bm_1092840192",
-                bm_meta_id="bm_1092840192",
-                name="Volzad Tech and Service (BM)",
-                verification_status="verified",
-                ad_accounts_count=1,
-                is_primary=True
-            )
-        ]
-    return bms
+    """Return Business Managers that were actually synced from Meta into PostgreSQL."""
+    result = await db.execute(
+        select(BusinessManager).order_by(BusinessManager.is_primary.desc(), BusinessManager.name.asc())
+    )
+    return result.scalars().all()
+
 
 @router.get("/auth/meta/adaccounts", response_model=List[AdAccountResponse], tags=["Meta OAuth"])
 async def list_meta_ad_accounts(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(AdAccount))
-    accounts = result.scalars().all()
-    if not accounts:
-        return [
-            AdAccountResponse(
-                id="acc_101",
-                account_id="act_89201948201",
-                account_name="Facebook & IG - Main Ecom Scale US",
-                business_manager_id="bm_1092840192",
-                currency="USD",
-                timezone="America/New_York",
-                spend_limit=250000.0,
-                amount_spent=0.0,
-                status="active"
-            )
-        ]
-    return accounts
+    """Return ad accounts that were actually synced from Meta into PostgreSQL."""
+    result = await db.execute(
+        select(AdAccount).order_by(AdAccount.account_name.asc())
+    )
+    return result.scalars().all()
+
 
 @router.post("/auth/meta/select", tags=["Meta OAuth"])
 async def select_meta_account_and_bm(
     body: MetaSelectionRequest,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    """
-    Save selected Business Manager, Ad Account, and Meta User inside PostgreSQL.
-    """
+    """Persist the user's selected real Business Manager and ad account."""
     bm_stmt = select(BusinessManager).where(
-        (BusinessManager.bm_meta_id == body.business_manager_id) | (BusinessManager.id == body.business_manager_id)
+        (BusinessManager.bm_meta_id == body.business_manager_id)
+        | (BusinessManager.id == body.business_manager_id)
     )
-    bm_res = await db.execute(bm_stmt)
-    bm = bm_res.scalar_one_or_none()
-    if bm:
-        bm.is_primary = True
+    bm = (await db.execute(bm_stmt)).scalar_one_or_none()
+    if not bm:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Business Manager not found.")
+
+    # Make the selected BM primary and clear the previous primary flag for the same Meta account.
+    await db.execute(
+        BusinessManager.__table__.update()
+        .where(BusinessManager.meta_account_id == bm.meta_account_id)
+        .values(is_primary=False)
+    )
+    bm.is_primary = True
 
     ad_acc_stmt = select(AdAccount).where(
-        (AdAccount.account_id == body.ad_account_id) | (AdAccount.id == body.ad_account_id)
+        (AdAccount.account_id == body.ad_account_id)
+        | (AdAccount.id == body.ad_account_id)
     )
-    ad_acc_res = await db.execute(ad_acc_stmt)
-    ad_acc = ad_acc_res.scalar_one_or_none()
-    if ad_acc:
-        ad_acc.status = "active"
+    ad_acc = (await db.execute(ad_acc_stmt)).scalar_one_or_none()
+    if not ad_acc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ad account not found.")
+
+    ad_acc.business_manager_id = bm.id
+    ad_acc.status = ad_acc.status or "unknown"
 
     await db.commit()
-    logger.info("meta_selection_saved", bm_id=body.business_manager_id, ad_account_id=body.ad_account_id)
+    logger.info(
+        "meta_selection_saved",
+        bm_id=body.business_manager_id,
+        ad_account_id=body.ad_account_id,
+    )
     return {
         "status": "success",
         "message": "Selection stored successfully in PostgreSQL.",
         "business_manager_id": body.business_manager_id,
-        "ad_account_id": body.ad_account_id
+        "ad_account_id": body.ad_account_id,
     }
