@@ -1,12 +1,12 @@
 import time
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, status
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from typing import List, Optional
 
-from app.database import get_db, AsyncSessionLocal
+from app.database import get_db
 from app.core.config import settings
 from app.core.security import decrypt_token, encrypt_token
 from app.models.models import (
@@ -36,10 +36,24 @@ async def verify_meta_webhook_alias(
     hub_challenge: Optional[str] = Query(None, alias="hub.challenge")
 ):
     """GET /api/v1/meta/webhook - Verification handshake for Meta Webhook subscription."""
-    expected_token = settings.META_WEBHOOK_VERIFY_TOKEN or "metamind_webhook_secret_v21"
-    if hub_mode == "subscribe" and hub_verify_token == expected_token:
-        return PlainTextResponse(content=str(hub_challenge or "OK"), status_code=200)
-    raise HTTPException(status_code=403, detail="Meta Webhook verification failed. Token mismatch.")
+    expected_token = settings.META_WEBHOOK_VERIFY_TOKEN
+    if not expected_token:
+        raise HTTPException(
+            status_code=500,
+            detail="META_WEBHOOK_VERIFY_TOKEN is not configured.",
+        )
+
+    if (
+        hub_mode == "subscribe"
+        and hub_verify_token == expected_token
+        and hub_challenge
+    ):
+        return PlainTextResponse(content=str(hub_challenge), status_code=200)
+
+    raise HTTPException(
+        status_code=403,
+        detail="Meta Webhook verification failed.",
+    )
 
 @router.post("/webhook")
 async def receive_meta_webhook_alias(
@@ -81,10 +95,6 @@ async def reprocess_meta_webhook_event(
     res = await reprocess_webhook_event_by_id(event_id=event_id, db=db)
     return WebhookReprocessResponse(event_id=event_id, status=res.get("status", "completed"), message="Reprocessed")
 
-async def background_sync_task(ad_account_id: Optional[str], sync_type: str):
-    async with AsyncSessionLocal() as db:
-        await run_meta_sync(ad_account_id=ad_account_id, sync_type=sync_type, db=db)
-
 @router.get("/sync", response_model=List[SyncStatusResponse])
 async def list_sync_jobs(db: AsyncSession = Depends(get_db)):
     """GET /api/v1/meta/sync - Retrieve recent Meta sync jobs history."""
@@ -96,7 +106,6 @@ async def list_sync_jobs(db: AsyncSession = Depends(get_db)):
 @router.post("/sync", response_model=SyncStatusResponse, status_code=status.HTTP_202_ACCEPTED)
 async def trigger_meta_sync(
     body: SyncTriggerRequest,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
     """POST /api/v1/meta/sync - Trigger background Meta Marketing API data download and sync."""
@@ -126,16 +135,11 @@ async def get_latest_sync_status(
     sync_job = result.scalar_one_or_none()
     
     if not sync_job:
-        # Return initial ready state if no sync job has been run yet
-        return SyncStatusResponse(
-            job_id="job_idle",
-            sync_type="manual",
-            status="completed",
-            current_object="ready",
-            records_downloaded=0,
-            progress_pct=100.0
+        raise HTTPException(
+            status_code=404,
+            detail="No Meta sync job has been created yet.",
         )
-        
+
     return sync_job
 
 @router.get("/campaigns", response_model=List[CampaignResponse])
@@ -232,172 +236,324 @@ async def send_meta_capi_event(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    POST /api/v1/meta/capi/event - Transmit server-side Conversions API (CAPI) event directly to Meta Graph API.
+    POST /api/v1/meta/capi/event - Transmit a server-side Conversions API
+    event directly to Meta Graph API.
     """
-    pixel_id = payload.pixel_id or "pix_1092840192"
-    
-    # Retrieve active OAuth token
-    tok_stmt = select(OAuthToken).where(OAuthToken.is_valid == True).order_by(OAuthToken.created_at.desc())
-    tok_res = await db.execute(tok_stmt)
-    token_rec = tok_res.scalar_one_or_none()
-    
-    access_token = decrypt_token(token_rec.encrypted_access_token) if token_rec else "EAAG_DUMMY_TOKEN"
-    
-    event_time = payload.event_time or int(time.time())
+    if not payload.pixel_id:
+        raise HTTPException(
+            status_code=400,
+            detail="pixel_id is required for a Meta Conversions API event.",
+        )
+
+    token_stmt = (
+        select(OAuthToken)
+        .where(OAuthToken.is_valid.is_(True))
+        .order_by(OAuthToken.created_at.desc())
+    )
+    token_res = await db.execute(token_stmt)
+    token_rec = token_res.scalar_one_or_none()
+
+    if not token_rec:
+        raise HTTPException(
+            status_code=401,
+            detail="No active Meta OAuth connection found.",
+        )
+
+    access_token = decrypt_token(token_rec.encrypted_access_token)
+    if not access_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Stored Meta access token is invalid.",
+        )
+
     event_data = {
         "event_name": payload.event_name,
-        "event_time": event_time,
+        "event_time": payload.event_time or int(time.time()),
         "action_source": payload.action_source,
-        "event_source_url": payload.event_source_url or "https://volzad.com/checkout",
-        "user_data": {
-            "em": [payload.user_data.email] if payload.user_data and payload.user_data.email else ["admin@volzad.com"],
-            "client_ip_address": payload.user_data.client_ip_address if payload.user_data else "127.0.0.1",
-            "client_user_agent": payload.user_data.client_user_agent if payload.user_data else "MetaMind CAPI/2.1"
-        },
-        "custom_data": {
-            "currency": payload.custom_data.currency if payload.custom_data else "USD",
-            "value": payload.custom_data.value if payload.custom_data else 150.0,
-            "content_name": payload.custom_data.content_name if payload.custom_data else "Volzad AI Retargeting Suite"
-        }
     }
 
-    capi_url = f"{META_GRAPH_URL}/{pixel_id}/events"
+    if payload.event_source_url:
+        event_data["event_source_url"] = payload.event_source_url
+
+    if payload.user_data:
+        user_data = {}
+        if payload.user_data.email:
+            user_data["em"] = [payload.user_data.email]
+        if payload.user_data.client_ip_address:
+            user_data["client_ip_address"] = payload.user_data.client_ip_address
+        if payload.user_data.client_user_agent:
+            user_data["client_user_agent"] = payload.user_data.client_user_agent
+        if user_data:
+            event_data["user_data"] = user_data
+
+    if payload.custom_data:
+        custom_data = {}
+        if payload.custom_data.currency:
+            custom_data["currency"] = payload.custom_data.currency
+        if payload.custom_data.value is not None:
+            custom_data["value"] = payload.custom_data.value
+        if payload.custom_data.content_name:
+            custom_data["content_name"] = payload.custom_data.content_name
+        if custom_data:
+            event_data["custom_data"] = custom_data
+
+    capi_url = f"{META_GRAPH_URL}/{payload.pixel_id}/events"
     capi_params = {"access_token": access_token}
     if payload.test_event_code:
         capi_params["test_event_code"] = payload.test_event_code
 
-    fbtrace = f"fbt_{time.time_ns()}"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            res = await client.post(capi_url, params=capi_params, json={"data": [event_data]})
-            if res.status_code == 200:
-                res_json = res.json()
-                fbtrace = res_json.get("fbtrace_id", fbtrace)
-                
-        # Store in CustomConversion table
-        conv_record = CustomConversionModel(
-            conversion_id=f"conv_{int(time.time())}",
-            name=f"CAPI Server Event: {payload.event_name}",
-            custom_event_type=payload.event_name.upper(),
-            rule="Server-Side CAPI Protocol",
-            default_conversion_value=payload.custom_data.value if payload.custom_data else 150.0
-        )
-        db.add(conv_record)
-        await db.commit()
+            response = await client.post(
+                capi_url,
+                params=capi_params,
+                json={"data": [event_data]},
+            )
+
+        try:
+            response_data = response.json()
+        except ValueError:
+            response_data = {}
+
+        if response.status_code != 200:
+            error = response_data.get("error", {})
+            error_message = (
+                error.get("message")
+                or f"Meta CAPI request failed with HTTP {response.status_code}."
+            )
+            raise HTTPException(status_code=502, detail=error_message)
 
         return MetaCapiEventResponse(
             status="SUCCESS",
-            events_received=1,
-            messages=["Event successfully accepted by Meta Conversions API Engine"],
-            fbtrace_id=fbtrace,
+            events_received=response_data.get("events_received", 1),
+            messages=["Meta accepted the Conversions API event."],
+            fbtrace_id=response_data.get("fbtrace_id"),
             event_name=payload.event_name,
-            pixel_id=pixel_id
+            pixel_id=payload.pixel_id,
         )
+
+    except HTTPException:
+        raise
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Meta Conversions API request failed: {exc}",
+        ) from exc
     except Exception as exc:
-        return MetaCapiEventResponse(
-            status="SUCCESS_FALLBACK",
-            events_received=1,
-            messages=[f"Server-side event queued locally: {exc}"],
-            fbtrace_id=fbtrace,
-            event_name=payload.event_name,
-            pixel_id=pixel_id
-        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to send Meta Conversions API event: {exc}",
+        ) from exc
+
 
 @router.get("/permissions", response_model=MetaPermissionsResponse)
 async def validate_meta_permissions(db: AsyncSession = Depends(get_db)):
     """
-    GET /api/v1/meta/permissions - Validate Meta OAuth permissions & scopes against Meta Graph API /me/permissions.
+    GET /api/v1/meta/permissions - Validate the active Meta OAuth token
+    against Meta Graph API /me/permissions.
     """
-    tok_stmt = select(OAuthToken).where(OAuthToken.is_valid == True).order_by(OAuthToken.created_at.desc())
-    tok_res = await db.execute(tok_stmt)
-    token_rec = tok_res.scalar_one_or_none()
+    token_stmt = (
+        select(OAuthToken)
+        .where(OAuthToken.is_valid.is_(True))
+        .order_by(OAuthToken.created_at.desc())
+    )
+    token_res = await db.execute(token_stmt)
+    token_rec = token_res.scalar_one_or_none()
 
     if not token_rec:
         return MetaPermissionsResponse(
             is_valid=False,
-            meta_user_id="unconnected",
+            meta_user_id="",
             permissions=[],
             granted_scopes=[],
-            declined_scopes=[]
+            declined_scopes=[],
         )
 
     access_token = decrypt_token(token_rec.encrypted_access_token)
-    perm_url = f"{META_GRAPH_URL}/me/permissions"
-    
-    items = []
-    granted = []
-    declined = []
-    meta_uid = "meta_usr_109284"
+    if not access_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Stored Meta access token is invalid.",
+        )
+
+    permissions_url = f"{META_GRAPH_URL}/me/permissions"
+    me_url = f"{META_GRAPH_URL}/me"
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            res = await client.get(perm_url, params={"access_token": access_token})
-            if res.status_code == 200:
-                data = res.json().get("data", [])
-                for p in data:
-                    perm_name = p.get("permission", "")
-                    p_status = p.get("status", "granted")
-                    items.append(MetaPermissionItem(permission=perm_name, status=p_status))
-                    if p_status == "granted":
-                        granted.append(perm_name)
-                    else:
-                        declined.append(perm_name)
-            else:
-                for sc in token_rec.scopes or ["ads_management", "ads_read", "business_management"]:
-                    items.append(MetaPermissionItem(permission=sc, status="granted"))
-                    granted.append(sc)
-    except Exception:
-        for sc in token_rec.scopes or ["ads_management", "ads_read", "business_management"]:
-            items.append(MetaPermissionItem(permission=sc, status="granted"))
-            granted.append(sc)
+            permissions_response = await client.get(
+                permissions_url,
+                params={"access_token": access_token},
+            )
+            me_response = await client.get(
+                me_url,
+                params={"access_token": access_token, "fields": "id"},
+            )
 
-    return MetaPermissionsResponse(
-        is_valid=True,
-        meta_user_id=meta_uid,
-        permissions=items,
-        granted_scopes=granted,
-        declined_scopes=declined
-    )
+        try:
+            permissions_payload = permissions_response.json()
+        except ValueError:
+            permissions_payload = {}
+
+        try:
+            me_payload = me_response.json()
+        except ValueError:
+            me_payload = {}
+
+        if permissions_response.status_code != 200:
+            error = permissions_payload.get("error", {})
+            raise HTTPException(
+                status_code=502,
+                detail=error.get(
+                    "message",
+                    f"Meta permissions request failed with HTTP {permissions_response.status_code}.",
+                ),
+            )
+
+        if me_response.status_code != 200:
+            error = me_payload.get("error", {})
+            raise HTTPException(
+                status_code=502,
+                detail=error.get(
+                    "message",
+                    f"Meta user lookup failed with HTTP {me_response.status_code}.",
+                ),
+            )
+
+        meta_user_id = me_payload.get("id")
+        if not meta_user_id:
+            raise HTTPException(
+                status_code=502,
+                detail="Meta did not return a user ID.",
+            )
+
+        items = []
+        granted = []
+        declined = []
+
+        for permission in permissions_payload.get("data", []):
+            permission_name = permission.get("permission")
+            permission_status = permission.get("status")
+
+            if not permission_name or not permission_status:
+                continue
+
+            items.append(
+                MetaPermissionItem(
+                    permission=permission_name,
+                    status=permission_status,
+                )
+            )
+
+            if permission_status == "granted":
+                granted.append(permission_name)
+            elif permission_status == "declined":
+                declined.append(permission_name)
+
+        return MetaPermissionsResponse(
+            is_valid=True,
+            meta_user_id=meta_user_id,
+            permissions=items,
+            granted_scopes=granted,
+            declined_scopes=declined,
+        )
+
+    except HTTPException:
+        raise
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Meta permissions request failed: {exc}",
+        ) from exc
+
 
 @router.post("/token/refresh")
 async def manual_meta_token_refresh(db: AsyncSession = Depends(get_db)):
     """
-    POST /api/v1/meta/token/refresh - Refresh active Meta OAuth access token using fb_exchange_token.
+    POST /api/v1/meta/token/refresh - Exchange the active Meta OAuth token
+    for a refreshed token using Meta's fb_exchange_token flow.
     """
-    tok_stmt = select(OAuthToken).where(OAuthToken.is_valid == True).order_by(OAuthToken.created_at.desc())
-    tok_res = await db.execute(tok_stmt)
-    token_rec = tok_res.scalar_one_or_none()
+    token_stmt = (
+        select(OAuthToken)
+        .where(OAuthToken.is_valid.is_(True))
+        .order_by(OAuthToken.created_at.desc())
+    )
+    token_res = await db.execute(token_stmt)
+    token_rec = token_res.scalar_one_or_none()
 
     if not token_rec:
-        raise HTTPException(status_code=400, detail="No active Meta OAuth connection found to refresh.")
+        raise HTTPException(
+            status_code=400,
+            detail="No active Meta OAuth connection found to refresh.",
+        )
 
-    app_id = settings.META_APP_ID or "1092840192840"
-    app_secret = settings.META_APP_SECRET or "dummy_app_secret"
+    app_id = settings.META_APP_ID
+    app_secret = settings.META_APP_SECRET
+
+    if not app_id or not app_secret:
+        raise HTTPException(
+            status_code=500,
+            detail="META_APP_ID and META_APP_SECRET must be configured.",
+        )
+
     old_token = decrypt_token(token_rec.encrypted_access_token)
+    if not old_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Stored Meta access token is invalid.",
+        )
 
-    new_token = old_token
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            ref_url = f"{META_GRAPH_URL}/oauth/access_token"
-            ref_params = {
-                "grant_type": "fb_exchange_token",
-                "client_id": app_id,
-                "client_secret": app_secret,
-                "fb_exchange_token": old_token
-            }
-            res = await client.get(ref_url, params=ref_params)
-            if res.status_code == 200:
-                new_token = res.json().get("access_token", old_token)
-    except Exception:
-        pass
-
-    token_rec.encrypted_access_token = encrypt_token(new_token)
-    token_rec.last_refreshed = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    await db.commit()
-
-    return {
-        "status": "success",
-        "message": "Meta OAuth access token refreshed successfully.",
-        "refreshed_at": token_rec.last_refreshed
+    refresh_url = f"{META_GRAPH_URL}/oauth/access_token"
+    refresh_params = {
+        "grant_type": "fb_exchange_token",
+        "client_id": app_id,
+        "client_secret": app_secret,
+        "fb_exchange_token": old_token,
     }
 
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(refresh_url, params=refresh_params)
+
+        try:
+            response_data = response.json()
+        except ValueError:
+            response_data = {}
+
+        if response.status_code != 200:
+            error = response_data.get("error", {})
+            raise HTTPException(
+                status_code=502,
+                detail=error.get(
+                    "message",
+                    f"Meta token refresh failed with HTTP {response.status_code}.",
+                ),
+            )
+
+        new_token = response_data.get("access_token")
+        if not new_token:
+            raise HTTPException(
+                status_code=502,
+                detail="Meta did not return a refreshed access token.",
+            )
+
+        token_rec.encrypted_access_token = encrypt_token(new_token)
+        token_rec.last_refreshed = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(),
+        )
+        await db.commit()
+
+        return {
+            "status": "success",
+            "message": "Meta OAuth access token refreshed successfully.",
+            "refreshed_at": token_rec.last_refreshed,
+        }
+
+    except HTTPException:
+        raise
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Meta token refresh request failed: {exc}",
+        ) from exc

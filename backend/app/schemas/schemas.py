@@ -1,5 +1,5 @@
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
-from typing import List, Optional, Any, Dict, Union 
+from typing import List, Optional, Any, Dict, Union
 
 class HealthResponse(BaseModel):
     status: str
@@ -22,8 +22,8 @@ class UserResponse(UserBase):
     id: str
     is_active: bool
     is_verified: bool = True
-    roles: List[str] = []
-    permissions: List[str] = []
+    roles: List[str] = Field(default_factory=list)
+    permissions: List[str] = Field(default_factory=list)
     model_config = ConfigDict(from_attributes=True)
 
 class RegisterRequest(BaseModel):
@@ -67,7 +67,7 @@ class RoleResponse(BaseModel):
     id: str
     name: str
     description: Optional[str] = None
-    permissions: List[str] = []
+    permissions: List[str] = Field(default_factory=list)
     model_config = ConfigDict(from_attributes=True)
 
 class PermissionResponse(BaseModel):
@@ -92,11 +92,11 @@ class MetaAuthStatusResponse(BaseModel):
     connected: bool
     meta_user_id: Optional[str] = None
     meta_user_name: Optional[str] = None
-    masked_token: str = "EAAG...9420xZ19"
-    token_type: str = "long_lived_user"
+    masked_token: Optional[str] = None
+    token_type: Optional[str] = None
     is_valid: bool = False
     expires_at: Optional[str] = None
-    scopes: List[str] = []
+    scopes: List[str] = Field(default_factory=list)
     last_connected: Optional[str] = None
     primary_business_name: Optional[str] = None
     primary_ad_account_name: Optional[str] = None
@@ -105,9 +105,9 @@ class BusinessManagerResponse(BaseModel):
     id: str
     bm_meta_id: str
     name: str
-    verification_status: str = "verified"
-    ad_accounts_count: int = 1
-    is_primary: bool = True
+    verification_status: Optional[str] = None
+    ad_accounts_count: int = 0
+    is_primary: bool = False
     model_config = ConfigDict(from_attributes=True)
 
 class AdAccountResponse(BaseModel):
@@ -115,21 +115,21 @@ class AdAccountResponse(BaseModel):
     account_id: str
     account_name: str
     business_manager_id: Optional[str] = None
-    currency: str = "USD"
-    timezone: str = "America/New_York"
-    spend_limit: float = 250000.0
+    currency: Optional[str] = None
+    timezone: Optional[str] = None
+    spend_limit: Optional[float] = None
     amount_spent: float = 0.0
-    status: str = "active"
+    status: Optional[str] = None
     pixel_id: Optional[str] = None
-    pixel_health: str = "optimal"
-    capi_health: str = "optimal"
+    pixel_health: Optional[str] = None
+    capi_health: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 class CampaignBase(BaseModel):
     name: str
-    status: str = "ACTIVE"
-    objective: str = "OUTCOME_SALES"
-    buying_type: str = "AUCTION"
+    status: Optional[str] = None
+    objective: Optional[str] = None
+    buying_type: Optional[str] = None
     daily_budget: float = 0.0
     lifetime_budget: float = 0.0
 
@@ -189,10 +189,10 @@ class AdSetResponse(BaseModel):
     id: str
     ad_set_id: str
     name: str
-    status: str = "ACTIVE"
+    status: Optional[str] = None
     daily_budget: float = 0.0
-    bid_strategy: str = "LOWEST_COST_WITHOUT_CAP"
-    optimization_goal: str = "OFFSITE_CONVERSIONS"
+    bid_strategy: Optional[str] = None
+    optimization_goal: Optional[str] = None
     target_audience: Optional[str] = None
     cpa: float = 0.0
     roas: float = 0.0
@@ -203,15 +203,15 @@ class AdResponse(BaseModel):
     id: str
     ad_id: str
     name: str
-    status: str = "ACTIVE"
-    format: str = "Video"
+    status: Optional[str] = None
+    format: Optional[str] = None
     creative_title: Optional[str] = None
     creative_body: Optional[str] = None
     media_url: Optional[str] = None
     ctr: float = 0.0
     cpc: float = 0.0
     spend: float = 0.0
-    fatigue_level: str = "Low"
+    fatigue_level: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 class CreativeResponse(BaseModel):
@@ -274,8 +274,8 @@ class CopilotRequest(BaseModel):
 
 class CopilotResponse(BaseModel):
     response: str
-    recommendations: List[str] = []
-    actions: List[dict] = []
+    recommendations: List[str] = Field(default_factory=list)
+    actions: List[dict] = Field(default_factory=list)
     execution_plan: Optional[dict] = None
     observability: Optional[dict] = None
 
@@ -301,8 +301,8 @@ class CopilotSummaryResponse(BaseModel):
     average_cpa: float
     top_performing_campaign: Optional[str] = None
     worst_performing_campaign: Optional[str] = None
-    key_insights: List[str] = []
-    actionable_recommendations: List[str] = []
+    key_insights: List[str] = Field(default_factory=list)
+    actionable_recommendations: List[str] = Field(default_factory=list)
     generated_at: str
 
 class WebSocketMessage(BaseModel):
@@ -345,12 +345,12 @@ class InsightResponse(BaseModel):
     cpc: float = 0.0
     cpm: float = 0.0
     cpa: float = 0.0
-    frequency: float = 1.0
+    frequency: float = 0.0
     roas: float = 0.0
     conversions: int = 0
     cost_per_result: float = 0.0
     budget: float = 0.0
-    status: str = "ACTIVE"
+    status: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 class DashboardKPIsResponse(BaseModel):
@@ -363,20 +363,20 @@ class DashboardKPIsResponse(BaseModel):
     cpa: float = 0.0
     reach: int = 0
     impressions: int = 0
-    frequency: float = 1.0
+    frequency: float = 0.0
     purchases: int = 0
     conversions: int = 0
     budget: float = 0.0
     campaign_count: int = 0
     ad_set_count: int = 0
     ads_count: int = 0
-    has_data: bool = True
+    has_data: bool = False
 
 class DashboardOverviewResponse(BaseModel):
     kpis: DashboardKPIsResponse
     last_sync_time: Optional[str] = None
-    connection_status: str = "connected"
-    is_synced: bool = True
+    connection_status: str = "not_connected"
+    is_synced: bool = False
 
 class ChartDataPoint(BaseModel):
     date: str
@@ -388,10 +388,10 @@ class ChartDataPoint(BaseModel):
     conversions: int = 0
 
 class DashboardChartsResponse(BaseModel):
-    spend_trend: List[ChartDataPoint] = []
-    revenue_trend: List[ChartDataPoint] = []
-    roas_trend: List[ChartDataPoint] = []
-    conversion_trend: List[ChartDataPoint] = []
+    spend_trend: List[ChartDataPoint] = Field(default_factory=list)
+    revenue_trend: List[ChartDataPoint] = Field(default_factory=list)
+    roas_trend: List[ChartDataPoint] = Field(default_factory=list)
+    conversion_trend: List[ChartDataPoint] = Field(default_factory=list)
 
 class TopCampaignItem(BaseModel):
     id: str
@@ -412,6 +412,7 @@ class TopAdItem(BaseModel):
     spend: float
     ctr: float
     cpc: float
+    fatigue_level: Optional[str] = None
 
 class BreakdownItem(BaseModel):
     dimension: str
@@ -478,7 +479,7 @@ class ReportResponse(BaseModel):
     id: str
     name: str
     report_type: str
-    generated_by: str = "usr_admin"
+    generated_by: str
     date_range: str
     filters: Optional[str] = None
     export_format: str
@@ -493,6 +494,9 @@ class ReportResponse(BaseModel):
 class TrendItem(BaseModel):
     metric: str
     current_value: float
+    previous_value: float = 0.0
+    percent_change: Optional[float] = None
+    direction: str = "flat"
 
 class ConditionBase(BaseModel):
     metric: str
@@ -508,8 +512,8 @@ class AutomationRuleCreate(BaseModel):
     description: Optional[str] = None
     trigger_type: str = "Campaign Spend"
     schedule: str = "Daily"
-    conditions: List[ConditionBase] = []
-    actions: List[ActionBase] = []
+    conditions: List[ConditionBase] = Field(default_factory=list)
+    actions: List[ActionBase] = Field(default_factory=list)
 
 class AutomationRuleUpdate(BaseModel):
     name: Optional[str] = None
@@ -530,8 +534,8 @@ class AutomationRuleResponse(BaseModel):
     execution_count: int = 0
     success_count: int = 0
     failure_count: int = 0
-    conditions: List[ConditionBase] = []
-    actions: List[ActionBase] = []
+    conditions: List[ConditionBase] = Field(default_factory=list)
+    actions: List[ActionBase] = Field(default_factory=list)
     created_at: Any
     model_config = ConfigDict(from_attributes=True)
 
@@ -780,7 +784,7 @@ class PasskeyRegisterRequest(BaseModel):
     name: Optional[str] = "Hardware Security Key"
     credential_id: Optional[str] = None
     public_key: Optional[str] = None
-    transports: Optional[List[str]] = ["internal", "usb"]
+    transports: Optional[List[str]] = None
     device_type: Optional[str] = "platform"
 
 class PasskeyVerifyRequest(BaseModel):
@@ -883,27 +887,27 @@ class MetaCapiUserData(BaseModel):
     fbp: Optional[str] = None
 
 class MetaCapiCustomData(BaseModel):
-    currency: Optional[str] = "USD"
-    value: Optional[float] = 0.0
+    currency: Optional[str] = None
+    value: Optional[float] = None
     content_name: Optional[str] = None
     content_ids: Optional[List[str]] = None
-    num_items: Optional[int] = 1
+    num_items: Optional[int] = None
 
 class MetaCapiEventRequest(BaseModel):
-    pixel_id: Optional[str] = "pix_1092840192"
-    event_name: str = "Purchase"
+    pixel_id: str
+    event_name: str
     event_time: Optional[int] = None
-    action_source: str = "website"
+    action_source: str
     event_source_url: Optional[str] = None
     user_data: Optional[MetaCapiUserData] = None
     custom_data: Optional[MetaCapiCustomData] = None
     test_event_code: Optional[str] = None
 
 class MetaCapiEventResponse(BaseModel):
-    status: str = "SUCCESS"
-    events_received: int = 1
-    messages: List[str] = []
-    fbtrace_id: str = ""
+    status: str
+    events_received: int
+    messages: List[str] = Field(default_factory=list)
+    fbtrace_id: Optional[str] = None
     event_name: str
     pixel_id: str
 
@@ -914,9 +918,9 @@ class MetaPermissionItem(BaseModel):
 class MetaPermissionsResponse(BaseModel):
     is_valid: bool = True
     meta_user_id: str
-    permissions: List[MetaPermissionItem]
-    granted_scopes: List[str]
-    declined_scopes: List[str]
+    permissions: List[MetaPermissionItem] = Field(default_factory=list)
+    granted_scopes: List[str] = Field(default_factory=list)
+    declined_scopes: List[str] = Field(default_factory=list)
 
 
 
