@@ -8,15 +8,7 @@ logger = logging.getLogger("metamind.celery")
 
 async def _async_sync_job():
     async with AsyncSessionLocal() as db:
-        from app.models.models import AdAccount
-        from sqlalchemy.future import select
-
-        account_stmt = select(AdAccount).where(AdAccount.status == "active").order_by(AdAccount.created_at.desc())
-        account_res = await db.execute(account_stmt)
-        active_account = account_res.scalar_one_or_none()
-
-        ad_account_id = active_account.account_id if active_account else None
-        res = await run_meta_sync(ad_account_id=ad_account_id, sync_type="scheduled", db=db)
+        res = await run_meta_sync(ad_account_id=None, sync_type="scheduled", db=db)
         return res
 
 @celery_app.task(bind=True, max_retries=5, default_retry_delay=60)

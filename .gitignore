@@ -68,5 +68,3 @@ logs/
 nginx/ssl/
 certbot/
 *_backup.py
-*.bak
-*.backup*
