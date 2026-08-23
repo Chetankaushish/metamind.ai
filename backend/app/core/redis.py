@@ -19,7 +19,6 @@ async def init_redis():
         redis_client = None
 
 async def close_redis():
-    global redis_client
     if redis_client:
         await redis_client.close()
         logger.info("redis_connection_closed")
@@ -37,8 +36,6 @@ async def get_redis():
     Return the active Redis client.
     Initialize it if it has not been initialized yet.
     """
-    global redis_client
-
     if redis_client is None:
         await init_redis()
 

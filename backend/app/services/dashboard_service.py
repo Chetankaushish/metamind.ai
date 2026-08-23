@@ -38,8 +38,6 @@ CACHE_STORE: Dict[str, Any] = {}
 class DashboardService:
     @staticmethod
     async def get_cache(key: str) -> Optional[Any]:
-        global CACHE_STORE
-
         try:
             r = redis.from_url(settings.REDIS_URL, decode_responses=True)
             val = await r.get(f"dashboard:{key}")
@@ -64,8 +62,6 @@ class DashboardService:
         data: Any,
         ttl_seconds: int = 300,
     ):
-        global CACHE_STORE
-
         CACHE_STORE[key] = data
 
         try:
@@ -87,8 +83,6 @@ class DashboardService:
 
     @staticmethod
     def invalidate_cache():
-        global CACHE_STORE
-
         CACHE_STORE.clear()
 
         try:
