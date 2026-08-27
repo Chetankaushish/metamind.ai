@@ -1,5 +1,3 @@
-
-
 services:
   # NGINX Reverse Proxy
   nginx:
@@ -31,11 +29,14 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        VITE_API_URL: https://adsmind.online/api/v1
+        NODE_ENV: production
     container_name: metamind_frontend
     restart: always
     environment:
       - NODE_ENV=production
-      - VITE_API_URL=https://${DOMAIN_NAME:-localhost}/api
+      - VITE_API_URL=https://adsmind.online/api/v1
     networks:
       - metamind_network
     expose:
@@ -55,11 +56,16 @@ services:
     container_name: metamind_backend
     restart: always
     environment:
-      - DATABASE_URL={DATABASE_URL}
+      - DATABASE_URL=${DATABASE_URL}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - ENVIRONMENT=production
       - REDIS_URL=redis://redis:6379/0
       - JWT_SECRET=${JWT_SECRET}
+      - SECRET_KEY=${JWT_SECRET}
       - META_APP_ID=${META_APP_ID}
       - META_APP_SECRET=${META_APP_SECRET}
+      - META_ACCESS_TOKEN=${META_ACCESS_TOKEN}
+      - META_REDIRECT_URI=${META_REDIRECT_URI}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - DOMAIN_NAME=${DOMAIN_NAME}
     depends_on:
@@ -84,10 +90,16 @@ services:
       dockerfile: Dockerfile
     container_name: metamind_celery_worker
     restart: always
-    command: celery -A app.celery_app worker --loglevel=info -c 4
+    command: celery -A app.celery_app worker --loglevel=info -c 4 -Q meta_sync,auth_tokens,default,celery
     environment:
-      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-metamind}:${POSTGRES_PASSWORD:-ChangeMeInProduction123!}@postgres:5432/${POSTGRES_DB:-metamind_prod}
+      - DATABASE_URL=${DATABASE_URL}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - REDIS_URL=redis://redis:6379/0
+      - META_APP_ID=${META_APP_ID}
+      - META_APP_SECRET=${META_APP_SECRET}
+      - META_ACCESS_TOKEN=${META_ACCESS_TOKEN}
+      - SECRET_KEY=${JWT_SECRET}
+      - JWT_SECRET=${JWT_SECRET}
     depends_on:
       backend:
         condition: service_healthy
@@ -107,8 +119,14 @@ services:
     restart: always
     command: celery -A app.celery_app beat --loglevel=info
     environment:
-      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-metamind}:${POSTGRES_PASSWORD:-Adsmind2026DB}@postgres:5432/${POSTGRES_DB:-metamind_prod}
+      - DATABASE_URL=${DATABASE_URL}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - REDIS_URL=redis://redis:6379/0
+      - META_APP_ID=${META_APP_ID}
+      - META_APP_SECRET=${META_APP_SECRET}
+      - META_ACCESS_TOKEN=${META_ACCESS_TOKEN}
+      - SECRET_KEY=${JWT_SECRET}
+      - JWT_SECRET=${JWT_SECRET}
     depends_on:
       backend:
         condition: service_healthy
@@ -125,9 +143,9 @@ services:
     container_name: metamind_postgres
     restart: always
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-metamind}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ChangeMeInProduction123!}
-      POSTGRES_DB: ${POSTGRES_DB:-metamind_prod}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -136,7 +154,7 @@ services:
     expose:
     - "5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-metamind} -d ${POSTGRES_DB:-metamind_prod}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 5
